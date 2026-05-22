@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# venv
+.venv/
+venv/
+env/
+# safety net for accidental venvs created via `python -m venv <typo>`
+**/pyvenv.cfg
+
+# tooling
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.tox/
+.nox/
+
+# editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# project
+*.log
+.env
+.env.local
+*.local
+
+# distill-specific
+# Postgres data dir if mounted into compose
+.pgdata/
+# stratoclave-distill local cache
+.distill-cache/
+.handover/

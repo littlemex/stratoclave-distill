@@ -1,0 +1,10 @@
+Alembic migrations for stratoclave-distill.
+
+Run with DATABASE_URL set, e.g.
+
+    DATABASE_URL=postgresql+psycopg://distill:distill@localhost:5432/distill \
+      alembic upgrade head
+
+The schema requires the ``vector`` (pgvector) extension. The first migration
+creates it, so the database role used by alembic must have CREATE EXTENSION
+privileges (Postgres superuser by default).

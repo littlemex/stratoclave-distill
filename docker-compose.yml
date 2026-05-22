@@ -1,0 +1,30 @@
+# Local Postgres + pgvector for stratoclave-distill development.
+#
+# Usage:
+#   docker compose up -d
+#   DATABASE_URL=postgresql+psycopg://distill:distill@localhost:5432/distill \
+#     alembic upgrade head
+#
+# The pgvector image already provides the `vector` and `pg_trgm` extensions;
+# the first migration (0001_initial_schema) just runs CREATE EXTENSION on
+# them so a fresh volume is bootstrapped with no manual steps.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: distill
+      POSTGRES_PASSWORD: distill
+      POSTGRES_DB: distill
+    ports:
+      - "5432:5432"
+    volumes:
+      - distill-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U distill -d distill"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  distill-pgdata:
