@@ -1,8 +1,8 @@
 # stratoclave-distill: Implementation Status
 
-**Last updated**: 2026-05-22
+**Last updated**: 2026-05-23
 **Project started**: 2026-05-22
-**Current stage**: Stage A (bootstrap)
+**Current stage**: Stage B (ingest pipeline) — complete; Stage C (query / export / gc) is the next milestone.
 
 ## Overall progress
 
@@ -14,14 +14,17 @@
 | `core.errors`                  | unit  | done       | Hierarchy verified |
 | `config.DistillerConfig`       | unit  | done       | Env loader + invariants enforced |
 | Provider abstractions (Stub / Anthropic / OpenAI / Voyage) | unit | done | Lazy SDK imports, dispatch tested |
-| CLI (`version`, `check-config`) | unit | done       | Stage B/C subcommands not yet wired |
+| CLI (`version`, `check-config`, `ingest`) | unit | done | Stage C subcommands not yet wired |
 | Postgres + pgvector schema     | unit (static), integration (opt-in) | done | alembic migration `0001_initial_schema` |
-| `Distiller` (Stage 1 LLM extract) | -  | planned    | Stage B |
-| `Curator` (dedup / merge / supersede) | - | planned   | Stage B |
+| `JsonlSessionReader`           | unit  | done       | Strict / lenient modes, malformed-line reporting |
+| `Distiller` (Stage 1 LLM extract) | unit | done    | One-shot prompt → purpose + digest + learnings |
+| `Curator` (dedup / merge / supersede) | unit | done | tau_merge / tau_conflict thresholds, RRF inputs |
+| `IngestRunner` (orchestrator)  | unit  | done       | Watermark-driven incremental ingest, error isolation |
+| Watermark / Purpose / Digest stores | unit + integration (opt-in) | done | In-memory + asyncpg, monotonic watermark, single-row digest |
+| `LearningStore` hybrid search  | unit + integration (opt-in) | done | Cosine + ts_rank_cd RRF in a single SQL CTE |
 | `Aggregator` (group rollup)    | -     | planned    | Stage C |
-| `Retriever` (RRF hybrid)       | -     | planned    | Stage C |
+| `Retriever` (RRF hybrid surface) | -   | planned    | Stage C (CLI `query`) |
 | `ContextPacker` (token budget) | -     | planned    | Stage C |
-| Watermark store                | -     | planned    | Stage B |
 
 ### Integration status
 
@@ -29,6 +32,7 @@
 |-------------------------|-------------|-------|
 | docker-compose Postgres | done        | `pgvector/pgvector:pg16` |
 | alembic migrations      | done        | `DISTILL_EMBEDDING_DIM` env-driven |
+| asyncpg + pgvector codec | done       | `init=_register_vector` on every connection |
 | Anthropic LLM           | scaffolded  | Real call exercised in Stage B e2e |
 | Voyage embedding        | scaffolded  | Real call exercised in Stage B e2e |
 | OpenAI LLM / embedding  | scaffolded  | Optional fallback |
@@ -42,46 +46,76 @@
   `SECURITY.md`, `CODE_OF_CONDUCT.md`, `.gitignore`.
 - `pyproject.toml` with hatchling, ruff, mypy strict, pytest markers
   (`integration`, `e2e`, `slow`).
-- Public dataclasses in `core.types`: `NormalizedTurn`, `SessionPurpose`,
-  `SessionDigest`, `Learning`, `GroupLearning`, `EmbeddingRecord`,
-  `ContextPackItem`, `ContextPack`. All frozen and `__slots__`-enabled.
-- Error hierarchy in `core.errors`: `DistillError` and six subclasses.
-- `DistillerConfig` (`config.py`) with env loader, invariants, and
-  override priority documented and tested.
-- LLM provider abstractions (`providers.llm`): `LLMProvider` Protocol +
-  `StubLLM` + `AnthropicLLM` + `OpenAILLM` (lazy SDK imports).
-- Embedding provider abstractions (`providers.embedding`): Protocol +
-  `StubEmbedding` (deterministic, unit-norm) + `VoyageEmbedding` +
-  `OpenAIEmbedding`.
-- CLI scaffolding (`cli.py`): `version` and `check-config` subcommands.
+- Public dataclasses in `core.types`, error hierarchy in `core.errors`,
+  env-driven `DistillerConfig` in `config.py`.
+- LLM and Embedding provider abstractions with `Stub*` implementations.
+- CLI scaffolding with `version` and `check-config`.
 - alembic migration `0001_initial_schema`: 5 tables + HNSW + tsvector
-  GIN indexes. Embedding dimension is env-driven so providers can swap
-  without forking the migration.
-- `docker-compose.yml` for local Postgres + pgvector.
-- Documentation: this file plus `GETTING_STARTED.md`, `PROJECT_RULES.md`,
-  and `DESIGN.md` (which points at the series-wide design in loom).
-- Test suite: 119 unit tests covering every Stage A module — type
-  invariants, error hierarchy, config edge cases, CLI exit codes,
-  schema-migration metadata, and **wire-level coverage** of the real
-  LLM / embedding adapters via injected fake SDK clients (so the
-  Anthropic / OpenAI / Voyage code paths are exercised without the SDKs
-  installed). Plus an opt-in integration test that runs `alembic
-  upgrade head` against a live Postgres + pgvector and asserts the
-  `vector` / `pg_trgm` extensions, every required HNSW / GIN index, and
-  that `alembic downgrade base` cleans the schema up. Total line
-  coverage on `src/stratoclave_distill`: 99% (only Protocol fall-through
-  branches missed).
+  GIN indexes, embedding dimension env-driven.
+- Documentation: `GETTING_STARTED.md`, `PROJECT_RULES.md`,
+  `PROJECT_STATUS.md`, `DESIGN.md`.
+
+### Stage B — Ingest pipeline (this milestone)
+
+- `pipeline.reader.JsonlSessionReader` parses JSONL transcripts into
+  `NormalizedTurn` instances. Lenient mode reports malformed lines via
+  `SkippedLine` records; strict mode aborts on the first parse error.
+- `pipeline.distiller.Distiller` implements the Stage 1 extraction:
+  builds a single LLM prompt (with optional prior `SessionPurpose`
+  context), validates the JSON envelope, and produces a tuple of
+  `SessionPurpose`, `SessionDigest`, and a list of `Learning` rows
+  alongside their embedding vectors.
+- `pipeline.curator.Curator` decides whether each candidate Learning is
+  a `merge` (above `tau_merge` cosine), a `supersede` (above
+  `tau_conflict` and explicitly contradictory), or an `insert`. The
+  cosine threshold is the gate; RRF is used only to rank the candidate
+  pool the threshold sees.
+- `pipeline.ingest.IngestRunner` orchestrates a full ingest: read JSONL,
+  group by `session_id`, skip turns at-or-below the watermark, run the
+  Distiller, run the Curator, persist via the four stores, and advance
+  the watermark. An error in one session does not block the others;
+  strict mode re-raises the first failure.
+- `db.stores` Protocols (`WatermarkStore`, `PurposeStore`, `DigestStore`,
+  `LearningStore`) define the persistence contract. `LearningSearchHit`
+  carries the cosine, the per-modality ranks, and the RRF score so
+  callers can apply thresholds without re-running the search.
+- `db.memory` provides in-memory implementations for unit tests and
+  offline demos. The hybrid search is done in pure Python: cosine on
+  every active row plus a deterministic BM25 surrogate, then RRF.
+- `db.asyncpg` provides the production implementation against Postgres
+  + pgvector. The pool registers the pgvector codec on every
+  connection. `search_hybrid` runs a single SQL statement that fuses
+  cosine and `ts_rank_cd` ranks via RRF in a CTE.
+- CLI `ingest <path> [--dry-run] [--strict] [--version-id ...]`
+  subcommand. Dry-run wires in-memory stores + stub providers (no DB,
+  no API keys). Production mode reads `DistillerConfig.from_env()`,
+  builds real LLM + Embedding providers, and opens an asyncpg pool.
+
+### Test surface (Stage A + B)
+
+- 225 passing unit tests; 11 integration tests gated on
+  `DISTILL_TEST_DATABASE_URL` (alembic migration round-trip + asyncpg
+  store contract — watermark monotonic advance, purpose idempotency,
+  digest delete-then-insert, learning insert / update / supersede /
+  list_active, and `search_hybrid` cosine ordering, archived exclusion,
+  scope filtering).
+- Line + branch coverage on `src/stratoclave_distill`: **92%**. The
+  remaining gap is mostly in the asyncpg SQL paths (covered by the
+  opt-in integration suite, not the unit run).
 
 ## Technical highlights
 
 - **No hard-coded paths, URLs, or credentials.** Every provider knob is
   routed through `DistillerConfig`. See `PROJECT_RULES.md`.
-- **Tests reflect real requirements.** Every assertion exists because the
-  pipeline depends on the property: dataclass freeze, vector unit-norm,
-  threshold ordering, env override priority, etc.
-- **Provider stubs are first-class.** Stage B can be developed entirely
-  offline because `StubLLM` and `StubEmbedding` mirror the real
-  contracts.
+- **In-memory parity with asyncpg.** The pipeline depends on Protocols,
+  so unit tests exercise the real orchestrator with the in-memory
+  stores; the integration suite exercises the same Protocols against a
+  live Postgres.
+- **Watermark-driven incremental ingest.** Re-running `ingest` on an
+  appended JSONL only distills the new turns, and a session-level
+  failure does not corrupt other sessions' watermarks.
+- **Audit-trail preservation.** `Curator` never deletes a Learning;
+  `supersede` sets `archived_at` + `superseded_by` on the old row.
 - **Schema is dimension-agnostic.** A single migration adapts to Voyage
   (1024) or OpenAI text-embedding-3-small (1536) via
   `DISTILL_EMBEDDING_DIM`.
@@ -90,26 +124,23 @@
 
 | Priority | Item | Stage |
 |----------|------|-------|
-| P0 | Distiller LLM extraction with watermarks | B |
-| P0 | Curator dedup / merge / supersede | B |
-| P0 | Persistent stores (asyncpg-backed `WatermarkStore`, `LearningStore`, `DigestStore`) | B |
-| P1 | Retriever RRF hybrid search                | C |
-| P1 | ContextPacker token-budget rendering       | C |
-| P1 | CLI `ingest` / `query` / `export` / `gc`   | B + C |
-| P2 | Aggregator group rollup                    | C |
-| P2 | Optional MCP server                        | v0.x |
-| P2 | Optional FastAPI HTTP server               | v0.x |
+| P0 | Retriever RRF hybrid search (CLI `query`)         | C |
+| P0 | ContextPacker token-budget rendering              | C |
+| P0 | CLI `query` / `export` / `gc`                     | C |
+| P1 | Aggregator group rollup (`group_learnings`)       | C |
+| P2 | Optional MCP server                               | v0.x |
+| P2 | Optional FastAPI HTTP server                      | v0.x |
 
 ## Team / ownership
 
 | Role             | Owner        | Status      | Current task |
 |------------------|--------------|-------------|--------------|
-| Maintainer       | littlemex    | active      | Stage A bootstrap |
+| Maintainer       | littlemex    | active      | Stage B done; preparing Stage C |
 
 ## Next steps
 
-1. Land Stage A on `main` (slug: `initial`).
-2. Begin Stage B: `Distiller` end-to-end against one captured JSONL,
-   then add `Curator`.
-3. Stage C: `Retriever` + `ContextPacker`, with `claude-capture` JSONL
-   used as the e2e fixture.
+1. Land Stage B on a feature branch via S3+EC2 push; open the PR.
+2. Begin Stage C: `Retriever` (hybrid search surface) +
+   `ContextPacker` (token-budget rendering) + CLI `query` / `export`
+   / `gc`.
+3. Optional polish: Aggregator group rollup once Stage C ships.
