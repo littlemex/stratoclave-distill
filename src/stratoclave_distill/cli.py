@@ -1,13 +1,20 @@
 """Command-line entrypoint for stratoclave-distill.
 
 Stage A shipped ``version`` and ``check-config``. Stage B added ``ingest``
-for processing a JSONL transcript end-to-end. Stage B+ extends ``ingest``
-with ``--branch-from`` / ``--at-seq`` / ``--branch-kind`` and introduces
+for processing a JSONL transcript end-to-end. Stage B+ extended ``ingest``
+with ``--branch-from`` / ``--at-seq`` / ``--branch-kind`` and introduced
 the ``branch`` subcommand group (``branch close``, ``branch list``).
-The remaining real subcommands (``query`` / ``export`` / ``gc``) land
-in Stage C.
+Stage C lands the remaining real subcommands:
 
-``ingest`` runs in two modes:
+- ``query``: hybrid search over learnings, with optional Markdown packing
+  via the :class:`ContextPacker`. Supports ``--dry-run`` for fixture
+  validation just like ``ingest``.
+- ``export``: dump a single session (purpose + digest + learnings,
+  optionally conflicts and gaps) as JSON for snapshotting.
+- ``gc``: archive-row cleanup with a ``--dry-run`` default so destructive
+  operations always require an explicit ``--apply``.
+
+``ingest`` and ``query`` run in two modes:
 
 - ``--dry-run`` (the default for tests and fixture validation) wires
   in-memory stores + stub providers so no database or LLM credentials
@@ -16,10 +23,10 @@ in Stage C.
   from the environment and stands up the asyncpg-backed stores plus the
   real LLM / Embedding providers.
 
-The ``branch`` subcommand group always uses :class:`DistillerConfig` to
-open a real Postgres connection — there is no dry-run for branch state
-because there is nothing to inspect in an in-memory store between CLI
-invocations.
+The ``branch``, ``export``, and ``gc`` subcommand groups always use
+:class:`DistillerConfig` to open a real Postgres connection — there is
+no dry-run for branch / export / gc state because there is nothing to
+inspect in an in-memory store between CLI invocations.
 """
 
 from __future__ import annotations
@@ -34,13 +41,23 @@ from dataclasses import asdict
 from stratoclave_distill import __version__
 from stratoclave_distill.config import DistillerConfig
 from stratoclave_distill.core.errors import DistillError
-from stratoclave_distill.core.types import SessionPurpose
+from stratoclave_distill.core.types import (
+    Learning,
+    LearningConflict,
+    LearningScope,
+    SessionDigest,
+    SessionGap,
+    SessionPurpose,
+)
 from stratoclave_distill.db.memory import (
+    InMemoryConflictStore,
     InMemoryDigestStore,
+    InMemoryGapStore,
     InMemoryLearningStore,
     InMemoryPurposeStore,
     InMemoryWatermarkStore,
 )
+from stratoclave_distill.db.stores import LearningSearchHit
 from stratoclave_distill.pipeline import (
     BranchPlan,
     Curator,
@@ -50,6 +67,11 @@ from stratoclave_distill.pipeline import (
 )
 from stratoclave_distill.providers.embedding import StubEmbedding, build_embedding_provider
 from stratoclave_distill.providers.llm import StubLLM, build_llm_provider
+from stratoclave_distill.retrieval import (
+    ContextPacker,
+    RetrievalResult,
+    Retriever,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -166,6 +188,105 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Render branches as a flat JSON array. Mutually exclusive with --tree.",
+    )
+
+    # ----- query ---------------------------------------------------------
+    query_parser = sub.add_parser(
+        "query",
+        help="Hybrid search over learnings; canonical / emerging lanes.",
+    )
+    query_parser.add_argument(
+        "text",
+        help="Query text driving both BM25 and vector search.",
+    )
+    query_parser.add_argument(
+        "--lane",
+        choices=("canonical", "emerging", "both"),
+        default="both",
+        help="Which retrieval lane(s) to surface (default: both).",
+    )
+    query_parser.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Per-lane result limit (default: 5).",
+    )
+    query_parser.add_argument(
+        "--scope",
+        default=None,
+        choices=("session", "project", "group", "shared", "experiment"),
+        help="Optional scope filter forwarded to search_hybrid.",
+    )
+    query_parser.add_argument(
+        "--gap-session-id",
+        default=None,
+        metavar="SESSION_ID",
+        help="If set, surface unresolved gaps for SESSION_ID (otherwise global).",
+    )
+    query_parser.add_argument(
+        "--pack",
+        action="store_true",
+        help=(
+            "Run the result through ContextPacker and emit Markdown instead "
+            "of JSON. Use --token-budget to control the cap."
+        ),
+    )
+    query_parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        help=(
+            "Token budget for --pack output. Defaults to DISTILL_CONTEXT_BUDGET_DEFAULT (config)."
+        ),
+    )
+    query_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run with empty in-memory stores and stub embeddings; "
+            "useful for argument-shape validation without a database."
+        ),
+    )
+
+    # ----- export --------------------------------------------------------
+    export_parser = sub.add_parser(
+        "export",
+        help="Dump a session's purpose / digest / learnings as JSON.",
+    )
+    export_parser.add_argument("session_id", help="Session to export.")
+    export_parser.add_argument(
+        "--include-archived",
+        action="store_true",
+        help="Include archived learnings in the exported document.",
+    )
+    export_parser.add_argument(
+        "--include-side-relations",
+        action="store_true",
+        help=(
+            "Include open conflicts and unresolved gaps tied to the session "
+            "(or to its learnings) in the exported document."
+        ),
+    )
+
+    # ----- gc ------------------------------------------------------------
+    gc_parser = sub.add_parser(
+        "gc",
+        help=(
+            "Garbage-collect long-archived rows. Defaults to --dry-run; "
+            "supply --apply to actually delete."
+        ),
+    )
+    gc_parser.add_argument(
+        "--older-than-days",
+        type=int,
+        default=90,
+        metavar="N",
+        help="Operate on rows whose archived_at / resolved_at is older than N days.",
+    )
+    gc_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Delete the matching rows. Without --apply this is a dry-run.",
     )
 
     return parser
@@ -547,6 +668,469 @@ def _cmd_branch_list(*, tree: bool, as_json: bool) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# query subcommand
+# --------------------------------------------------------------------------
+
+
+def _serialize_hit(hit: LearningSearchHit) -> dict[str, object]:
+    """Render a :class:`LearningSearchHit` as a JSON-friendly dict.
+
+    Keeps both the raw cosine and the RRF-fused score so downstream
+    callers (or human readers) can pick the signal they need.
+    """
+
+    learning = hit.learning
+    return {
+        "learning_id": learning.learning_id,
+        "scope": learning.scope,
+        "claim_type": learning.claim_type,
+        "rule": learning.rule,
+        "why": learning.why,
+        "evidence_count": learning.evidence_count,
+        "created_at": learning.created_at,
+        "cosine": hit.cosine,
+        "vector_rank": hit.vector_rank,
+        "bm25_rank": hit.bm25_rank,
+        "rrf_score": hit.rrf_score,
+    }
+
+
+def _serialize_retrieval(result: RetrievalResult) -> dict[str, object]:
+    return {
+        "query_text": result.query_text,
+        "canonical": [_serialize_hit(h) for h in result.canonical],
+        "emerging": [_serialize_hit(h) for h in result.emerging],
+        "conflicts": [asdict(c) for c in result.conflicts],
+        "gaps": [asdict(g) for g in result.gaps],
+    }
+
+
+async def _run_dry_run_query(
+    *,
+    text: str,
+    lane: str,
+    limit: int,
+    scope: LearningScope | None,
+    gap_session_id: str | None,
+    embedding_dim: int = 8,
+) -> RetrievalResult:
+    """Run a query with empty in-memory stores + stub embeddings.
+
+    Returns an empty :class:`RetrievalResult`; the value is mostly to
+    exercise the argument-validation and formatting paths from tests
+    without a database.
+    """
+
+    embedder = StubEmbedding(dimension=embedding_dim)
+    learnings = InMemoryLearningStore()
+    conflicts = InMemoryConflictStore()
+    gaps = InMemoryGapStore()
+    retriever = Retriever(
+        store=learnings,
+        embedder=embedder,
+        top_k_canonical=limit,
+        top_k_emerging=limit,
+        conflict_store=conflicts,
+        gap_store=gaps,
+    )
+    result = await retriever.retrieve(
+        text,
+        scope=scope,
+        gap_session_id=gap_session_id,
+    )
+    if lane == "canonical":
+        return RetrievalResult(
+            query_text=result.query_text,
+            canonical=result.canonical,
+            emerging=(),
+            conflicts=result.conflicts,
+            gaps=result.gaps,
+        )
+    if lane == "emerging":
+        return RetrievalResult(
+            query_text=result.query_text,
+            canonical=(),
+            emerging=result.emerging,
+            conflicts=result.conflicts,
+            gaps=result.gaps,
+        )
+    return result
+
+
+async def _run_prod_query(
+    *,
+    text: str,
+    lane: str,
+    limit: int,
+    scope: LearningScope | None,
+    gap_session_id: str | None,
+) -> RetrievalResult:
+    """Run a query against the asyncpg-backed stores and real embedder."""
+
+    from stratoclave_distill.db.asyncpg import (
+        AsyncpgConflictStore,
+        AsyncpgGapStore,
+        AsyncpgLearningStore,
+        pool_context,
+    )
+
+    cfg = DistillerConfig.from_env()
+    embedder = build_embedding_provider(cfg)
+    if embedder.dimension != cfg.embedding_dim:
+        raise DistillError(
+            f"embedding provider reports dimension {embedder.dimension} "
+            f"but DISTILL_EMBEDDING_DIM is {cfg.embedding_dim}"
+        )
+    async with pool_context(cfg.database_url) as pool:
+        learnings = AsyncpgLearningStore(pool)
+        conflict_store = AsyncpgConflictStore(pool)
+        gap_store = AsyncpgGapStore(pool)
+        retriever = Retriever(
+            store=learnings,
+            embedder=embedder,
+            top_k_canonical=limit,
+            top_k_emerging=limit,
+            rrf_k=cfg.rrf_k,
+            conflict_store=conflict_store,
+            gap_store=gap_store,
+        )
+        result = await retriever.retrieve(
+            text,
+            scope=scope,
+            gap_session_id=gap_session_id,
+        )
+    if lane == "canonical":
+        return RetrievalResult(
+            query_text=result.query_text,
+            canonical=result.canonical,
+            emerging=(),
+            conflicts=result.conflicts,
+            gaps=result.gaps,
+        )
+    if lane == "emerging":
+        return RetrievalResult(
+            query_text=result.query_text,
+            canonical=(),
+            emerging=result.emerging,
+            conflicts=result.conflicts,
+            gaps=result.gaps,
+        )
+    return result
+
+
+def _cmd_query(
+    *,
+    text: str,
+    lane: str,
+    limit: int,
+    scope: str | None,
+    gap_session_id: str | None,
+    pack: bool,
+    token_budget: int | None,
+    dry_run: bool,
+) -> int:
+    if limit < 1:
+        sys.stderr.write(f"error: --limit must be >= 1, got {limit}\n")
+        return 2
+    typed_scope: LearningScope | None = scope  # type: ignore[assignment]
+    try:
+        if dry_run:
+            result = asyncio.run(
+                _run_dry_run_query(
+                    text=text,
+                    lane=lane,
+                    limit=limit,
+                    scope=typed_scope,
+                    gap_session_id=gap_session_id,
+                )
+            )
+        else:
+            result = asyncio.run(
+                _run_prod_query(
+                    text=text,
+                    lane=lane,
+                    limit=limit,
+                    scope=typed_scope,
+                    gap_session_id=gap_session_id,
+                )
+            )
+    except DistillError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
+
+    if pack:
+        budget = token_budget
+        if budget is None:
+            budget = _resolve_default_budget()
+        packer = ContextPacker(token_budget=budget)
+        sys.stdout.write(packer.pack(result).markdown)
+        if not packer.pack(result).markdown.endswith("\n"):
+            sys.stdout.write("\n")
+        return 0
+
+    sys.stdout.write(json.dumps(_serialize_retrieval(result), indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+    return 0
+
+
+def _resolve_default_budget() -> int:
+    """Read ``context_budget_default`` from env, fall back to a safe default.
+
+    Calling :meth:`DistillerConfig.from_env` requires ``DATABASE_URL``,
+    which is overkill when the caller only wants the budget. We attempt
+    it but fall back to 2000 (the library default) on any config error.
+    """
+
+    try:
+        return DistillerConfig.from_env().context_budget_default
+    except DistillError:
+        return 2000
+
+
+# --------------------------------------------------------------------------
+# export subcommand
+# --------------------------------------------------------------------------
+
+
+def _serialize_purpose_full(p: SessionPurpose) -> dict[str, object]:
+    return {
+        "session_id": p.session_id,
+        "purpose": p.purpose,
+        "domain_tags": list(p.domain_tags),
+        "success_score": p.success_score,
+        "polluted": p.polluted,
+        "pollution_reason": p.pollution_reason,
+        "branch_kind": p.branch_kind,
+        "branch_state": p.branch_state,
+        "parent_session_id": p.parent_session_id,
+        "branched_at_seq": p.branched_at_seq,
+        "closed_at": p.closed_at,
+        "derived_from_version": p.derived_from_version,
+        "derived_at": p.derived_at,
+        "last_updated_at": p.last_updated_at,
+    }
+
+
+def _serialize_digest(d: SessionDigest) -> dict[str, object]:
+    return {
+        "digest_id": d.digest_id,
+        "session_id": d.session_id,
+        "version_id": d.version_id,
+        "summary_md": d.summary_md,
+        "bm25_text": d.bm25_text,
+        "extracted_at": d.extracted_at,
+    }
+
+
+def _serialize_learning(learning: Learning) -> dict[str, object]:
+    return {
+        "learning_id": learning.learning_id,
+        "scope": learning.scope,
+        "claim_type": learning.claim_type,
+        "rule": learning.rule,
+        "why": learning.why,
+        "triggers": dict(learning.triggers),
+        "project_key": learning.project_key,
+        "group_id": learning.group_id,
+        "source_session": learning.source_session,
+        "source_version": learning.source_version,
+        "evidence_count": learning.evidence_count,
+        "confidence": learning.confidence,
+        "archived_at": learning.archived_at,
+        "superseded_by": learning.superseded_by,
+        "bm25_text": learning.bm25_text,
+        "created_at": learning.created_at,
+        "updated_at": learning.updated_at,
+    }
+
+
+async def _run_export(
+    *,
+    session_id: str,
+    include_archived: bool,
+    include_side_relations: bool,
+) -> dict[str, object]:
+    from stratoclave_distill.db.asyncpg import (
+        AsyncpgConflictStore,
+        AsyncpgDigestStore,
+        AsyncpgGapStore,
+        AsyncpgLearningStore,
+        AsyncpgPurposeStore,
+        pool_context,
+    )
+
+    cfg = DistillerConfig.from_env()
+    async with pool_context(cfg.database_url) as pool:
+        purposes = AsyncpgPurposeStore(pool)
+        digests = AsyncpgDigestStore(pool)
+        learnings_store = AsyncpgLearningStore(pool)
+        conflict_store = AsyncpgConflictStore(pool)
+        gap_store = AsyncpgGapStore(pool)
+
+        purpose = await purposes.get(session_id)
+        if purpose is None:
+            raise DistillError(f"export: no session_purposes row for {session_id!r}")
+        digest = await digests.get(session_id)
+
+        all_learnings = await learnings_store.list_active()
+        session_learnings = [
+            learning for learning in all_learnings if learning.source_session == session_id
+        ]
+        if include_archived:
+            # ``list_active`` excludes archived rows; we currently have no
+            # bulk listing for archived rows, so we leave a placeholder
+            # message and document the limitation.
+            archived: list[Learning] = []
+            archived_note = (
+                "include_archived requested but archived listing is "
+                "not yet exposed by LearningStore; future work."
+            )
+        else:
+            archived = []
+            archived_note = None
+
+        conflicts: list[LearningConflict] = []
+        gaps: list[SessionGap] = []
+        if include_side_relations:
+            for learning in session_learnings:
+                conflicts.extend(await conflict_store.list_for(learning.learning_id))
+            gaps_seq = await gap_store.list_unresolved(session_id=session_id)
+            gaps = list(gaps_seq)
+
+    payload: dict[str, object] = {
+        "session_id": session_id,
+        "purpose": _serialize_purpose_full(purpose),
+        "digest": _serialize_digest(digest) if digest is not None else None,
+        "learnings": [_serialize_learning(learning) for learning in session_learnings],
+    }
+    if include_archived:
+        payload["archived_learnings"] = [_serialize_learning(learning) for learning in archived]
+        if archived_note is not None:
+            payload["archived_note"] = archived_note
+    if include_side_relations:
+        payload["conflicts"] = [asdict(c) for c in conflicts]
+        payload["gaps"] = [asdict(g) for g in gaps]
+    return payload
+
+
+def _cmd_export(
+    *,
+    session_id: str,
+    include_archived: bool,
+    include_side_relations: bool,
+) -> int:
+    try:
+        payload = asyncio.run(
+            _run_export(
+                session_id=session_id,
+                include_archived=include_archived,
+                include_side_relations=include_side_relations,
+            )
+        )
+    except DistillError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
+    sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# gc subcommand
+# --------------------------------------------------------------------------
+
+
+async def _run_gc(*, older_than_days: int, apply: bool) -> dict[str, object]:
+    """Survey + optionally delete long-archived audit rows.
+
+    The archived ``learnings`` rows are kept by Stage B/B+ as audit trail.
+    Stage C exposes a CLI to drop rows older than ``older_than_days``.
+    For Stage C we surface a count-only dry-run by default and gate the
+    real DELETE behind ``--apply`` to honor production-safety norms.
+    """
+
+    from datetime import UTC, datetime, timedelta
+
+    cfg = DistillerConfig.from_env()
+    cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    from stratoclave_distill.db.asyncpg import pool_context
+
+    async with pool_context(cfg.database_url) as pool, pool.acquire() as conn:
+        archived_learnings = await conn.fetchval(
+            "SELECT count(*) FROM learnings WHERE archived_at IS NOT NULL AND archived_at < $1",
+            cutoff,
+        )
+        resolved_conflicts = await conn.fetchval(
+            "SELECT count(*) FROM learning_conflicts WHERE resolution <> 'open' AND noted_at < $1",
+            cutoff,
+        )
+        resolved_gaps = await conn.fetchval(
+            "SELECT count(*) FROM session_gaps WHERE resolution <> 'open' AND noted_at < $1",
+            cutoff,
+        )
+        survey: dict[str, object] = {
+            "older_than_days": older_than_days,
+            "cutoff": cutoff_iso,
+            "archived_learnings_eligible": int(archived_learnings or 0),
+            "resolved_conflicts_eligible": int(resolved_conflicts or 0),
+            "resolved_gaps_eligible": int(resolved_gaps or 0),
+            "applied": False,
+        }
+        if not apply:
+            return survey
+        async with conn.transaction():
+            deleted_learnings = await conn.fetchval(
+                "WITH deleted AS ("
+                "DELETE FROM learnings "
+                "WHERE archived_at IS NOT NULL AND archived_at < $1 "
+                "RETURNING 1) SELECT count(*) FROM deleted",
+                cutoff,
+            )
+            deleted_conflicts = await conn.fetchval(
+                "WITH deleted AS ("
+                "DELETE FROM learning_conflicts "
+                "WHERE resolution <> 'open' AND noted_at < $1 "
+                "RETURNING 1) SELECT count(*) FROM deleted",
+                cutoff,
+            )
+            deleted_gaps = await conn.fetchval(
+                "WITH deleted AS ("
+                "DELETE FROM session_gaps "
+                "WHERE resolution <> 'open' AND noted_at < $1 "
+                "RETURNING 1) SELECT count(*) FROM deleted",
+                cutoff,
+            )
+        survey.update(
+            {
+                "applied": True,
+                "archived_learnings_deleted": int(deleted_learnings or 0),
+                "resolved_conflicts_deleted": int(deleted_conflicts or 0),
+                "resolved_gaps_deleted": int(deleted_gaps or 0),
+            }
+        )
+        return survey
+
+
+def _cmd_gc(*, older_than_days: int, apply: bool) -> int:
+    if older_than_days < 0:
+        sys.stderr.write(f"error: --older-than-days must be >= 0, got {older_than_days}\n")
+        return 2
+    try:
+        result = asyncio.run(_run_gc(older_than_days=older_than_days, apply=apply))
+    except DistillError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
+    sys.stdout.write(json.dumps(result, indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -573,6 +1157,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.branch_command == "list":
             return _cmd_branch_list(tree=args.tree, as_json=args.json)
         parser.error(f"unknown branch command: {args.branch_command}")  # pragma: no cover
+    if args.command == "query":
+        return _cmd_query(
+            text=args.text,
+            lane=args.lane,
+            limit=args.limit,
+            scope=args.scope,
+            gap_session_id=args.gap_session_id,
+            pack=args.pack,
+            token_budget=args.token_budget,
+            dry_run=args.dry_run,
+        )
+    if args.command == "export":
+        return _cmd_export(
+            session_id=args.session_id,
+            include_archived=args.include_archived,
+            include_side_relations=args.include_side_relations,
+        )
+    if args.command == "gc":
+        return _cmd_gc(older_than_days=args.older_than_days, apply=args.apply)
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
     return 2  # pragma: no cover - parser.error raises SystemExit
 

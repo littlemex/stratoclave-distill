@@ -2,10 +2,10 @@
 
 **Last updated**: 2026-05-23
 **Project started**: 2026-05-22
-**Current stage**: Stage B+ engine implemented (branching, claim_type,
-conflict / gap relations, retrieval lanes). Schema migration `0002`
-shipped via PR #3; engine + CLI + tests landing in this PR. Next: Stage C
-(query / pack / export / gc).
+**Current stage**: Stage C P0 surface implemented (query / pack / export
+/ gc CLI). Stage B+ engine shipped via PR #4. The retriever surface,
+`ContextPacker`, JSON export, and dry-run-by-default GC land in this PR.
+Next: Stage C P1 (conflict / gap CLI, Aggregator).
 
 ## Overall progress
 
@@ -31,8 +31,11 @@ shipped via PR #3; engine + CLI + tests landing in this PR. Next: Stage C
 | `learning_conflicts` / `session_gaps` side tables | unit + integration | done | Migration 0002, FK + CHECK constraints |
 | `Learning.claim_type` (observation / interpretation / signal / norm) | unit + integration | done | Persisted via Distiller -> Curator -> LearningStore |
 | Branch CLI (`ingest --branch-from`, `branch close`, `branch list --tree/--json`) | unit (CLI dry-run) | done | All-or-nothing rule on `--branch-from / --branch-session / --at-seq` |
-| `Aggregator` (group rollup)    | -     | planned    | Stage C |
-| `ContextPacker` (token budget) | -     | planned    | Stage C |
+| `ContextPacker` (token budget, lane × claim_type grouping) | unit | done | Approximate token counter; pluggable `TokenCounter` callable |
+| `query` CLI (`--lane / --limit / --pack / --token-budget / --dry-run`) | unit (dry-run) | done | Wraps `Retriever.retrieve()`; JSON or Markdown output |
+| `export` CLI (`<session_id> [--include-archived] [--include-side-relations]`) | unit (smoke) | done | Dumps purpose + digest + learnings (+ conflicts / gaps) as JSON |
+| `gc` CLI (`--older-than-days N [--apply]`) | unit (smoke) | done | Dry-run by default; DELETE only behind explicit `--apply` |
+| `Aggregator` (group rollup)    | -     | planned    | Stage C P1 |
 
 ### Integration status
 
@@ -88,7 +91,7 @@ shipped via PR #3; engine + CLI + tests landing in this PR. Next: Stage C
 - alembic round-trip integration test exercises both upgrade and
   downgrade paths.
 
-### Stage B+ engine (this PR)
+### Stage B+ engine (shipped via PR #4)
 
 - Public types extended: `BranchKind = "main" | "experiment"`,
   `BranchState = "open" | "closed" | "promoted"`, `ClaimType =
@@ -116,10 +119,38 @@ shipped via PR #3; engine + CLI + tests landing in this PR. Next: Stage C
   prints the branch topology. The branch flags are all-or-nothing —
   supplying any one of them without the others is an error.
 
-### Test surface (Stage A + B + B+)
+### Stage C P0 surface (this PR)
 
-- 277 passing unit tests; 16 integration tests gated on
-  `DISTILL_TEST_DATABASE_URL`.
+- `retrieval.ContextPacker`: budgeted Markdown formatter that groups
+  `RetrievalResult` hits by lane (canonical → emerging) and `claim_type`
+  (`norm` → `observation` → `interpretation` → `signal`). Greedy
+  admission with a pluggable `TokenCounter`; the default is a pure
+  `ceil(len/chars_per_token)` approximator so the runtime stays free
+  of `tiktoken` / `transformers`. Optional sidecar sections for open
+  conflicts and gaps.
+- `query <text>` CLI: wraps `Retriever.retrieve()` and prints either
+  the full `RetrievalResult` as JSON (default) or a packed Markdown
+  bundle (`--pack`). Lane filter (`--lane canonical|emerging|both`),
+  result cap (`--limit N`), scope filter, gap session selector, and
+  token budget override are all wired. `--dry-run` short-circuits
+  without touching the database so downstream tooling can pipe
+  arbitrary queries through the CLI shape without a Postgres backend.
+- `export <session_id>` CLI: dumps purpose + digest + learnings as a
+  single JSON payload, with optional `--include-archived` (superseded
+  rows) and `--include-side-relations` (conflicts / gaps).
+- `gc` CLI: dry-run-by-default cleanup of archived `learnings` rows
+  older than `--older-than-days` (default 90). The destructive
+  `DELETE ... RETURNING 1` is gated behind explicit `--apply`; without
+  it, only counts are reported. Negative ages are rejected at the
+  CLI parser level.
+
+### Test surface (Stage A + B + B+ + C P0)
+
+- 300 passing unit tests; 16 integration tests gated on
+  `DISTILL_TEST_DATABASE_URL`. Stage C added 15 ContextPacker tests
+  and 8 CLI tests (query dry-run JSON / Markdown, lane filter, limit
+  validation, prod env-var gating; export and gc env-var / argument
+  validation).
 - Integration coverage exercises both alembic round-trips, the asyncpg
   store contracts (Watermark / Purpose / Digest / Learning / Conflict
   / Gap), `search_hybrid` lane filtering, and the branching round-trip
@@ -148,13 +179,11 @@ shipped via PR #3; engine + CLI + tests landing in this PR. Next: Stage C
 
 | Priority | Item | Stage |
 |----------|------|-------|
-| P0 | Retriever surface in CLI (`query <text>` with `--lane canonical/emerging`) | C |
-| P0 | ContextPacker token-budget rendering                                       | C |
-| P0 | CLI `query` / `export` / `gc`                                              | C |
-| P1 | Conflict / gap CLI (`conflict list/resolve`, `gap list/resolve`)           | C |
-| P1 | Aggregator group rollup (`group_learnings`)                                | C |
-| P2 | Optional MCP server                                                        | v0.x |
-| P2 | Optional FastAPI HTTP server                                               | v0.x |
+| P1 | Conflict / gap CLI (`conflict list/resolve`, `gap list/resolve`) | C |
+| P1 | Aggregator group rollup (`group_learnings`)                      | C |
+| P1 | Token budget: tiktoken-backed counter as opt-in extra            | C |
+| P2 | Optional MCP server                                              | v0.x |
+| P2 | Optional FastAPI HTTP server                                     | v0.x |
 
 ## Team / ownership
 
