@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 from stratoclave_distill.core.errors import ConfigError
@@ -109,6 +110,54 @@ async def pool_context(
         await pool.close()
 
 
+def _to_datetime(value: str | datetime | None) -> datetime:
+    """Coerce ISO-8601 strings to aware datetimes for asyncpg's binary codec.
+
+    Public types carry timestamps as ISO strings, but asyncpg's ``timestamptz``
+    encoder demands a ``datetime.datetime`` regardless of any SQL ``::timestamptz``
+    cast (the cast applies after the binary parameter is parsed). We accept a
+    ``datetime`` as-is and treat ``None`` / empty as "now (UTC)".
+    """
+
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if value is None or value == "":
+        return datetime.now(UTC)
+    text = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(text)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _to_optional_datetime(value: str | datetime | None) -> datetime | None:
+    """Like :func:`_to_datetime` but preserves ``None`` for nullable columns."""
+
+    if value is None or value == "":
+        return None
+    return _to_datetime(value)
+
+
+def _from_datetime(value: datetime | None) -> str:
+    """Render a datetime as the ``...Z`` ISO-8601 form the public types use.
+
+    Postgres ``timestamptz`` returns timezone-aware ``datetime`` whose
+    ``isoformat()`` emits ``+00:00``. The Stage B contract — and the
+    in-memory store — render the same instant as ``...Z``, so we normalize
+    here to keep round-trips byte-equivalent.
+    """
+
+    if value is None:
+        return ""
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    aware_utc = aware.astimezone(UTC)
+    return aware_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _from_optional_datetime(value: datetime | None) -> str | None:
+    """Like :func:`_from_datetime` but preserves ``None`` for nullable columns."""
+
+    return None if value is None else _from_datetime(value)
+
+
 def _row_to_purpose(row: Any) -> SessionPurpose:
     tags_raw = row["domain_tags"]
     tags = json.loads(tags_raw) if isinstance(tags_raw, str) else (tags_raw or [])
@@ -120,8 +169,8 @@ def _row_to_purpose(row: Any) -> SessionPurpose:
         polluted=bool(row["polluted"]),
         pollution_reason=row["pollution_reason"],
         derived_from_version=row["derived_from_version"],
-        derived_at=row["derived_at"].isoformat() if row["derived_at"] else "",
-        last_updated_at=row["last_updated_at"].isoformat() if row["last_updated_at"] else "",
+        derived_at=_from_datetime(row["derived_at"]),
+        last_updated_at=_from_datetime(row["last_updated_at"]),
     )
 
 
@@ -132,7 +181,7 @@ def _row_to_digest(row: Any) -> SessionDigest:
         version_id=row["version_id"],
         summary_md=row["summary_md"],
         bm25_text=row["bm25_text"],
-        extracted_at=row["extracted_at"].isoformat() if row["extracted_at"] else "",
+        extracted_at=_from_datetime(row["extracted_at"]),
     )
 
 
@@ -151,11 +200,11 @@ def _row_to_learning(row: Any) -> Learning:
         source_version=row["source_version"],
         evidence_count=row["evidence_count"],
         confidence=row["confidence"],
-        archived_at=row["archived_at"].isoformat() if row["archived_at"] else None,
+        archived_at=_from_optional_datetime(row["archived_at"]),
         superseded_by=(str(row["superseded_by"]) if row["superseded_by"] is not None else None),
         bm25_text=row["bm25_text"],
-        created_at=row["created_at"].isoformat() if row["created_at"] else "",
-        updated_at=row["updated_at"].isoformat() if row["updated_at"] else "",
+        created_at=_from_datetime(row["created_at"]),
+        updated_at=_from_datetime(row["updated_at"]),
     )
 
 
@@ -182,14 +231,14 @@ class AsyncpgWatermarkStore:
             await conn.execute(
                 """
                 INSERT INTO distill_watermarks (session_id, published_up_to, last_run_at)
-                VALUES ($1, $2, $3::timestamptz)
+                VALUES ($1, $2, $3)
                 ON CONFLICT (session_id) DO UPDATE
                 SET published_up_to = GREATEST(distill_watermarks.published_up_to, EXCLUDED.published_up_to),
                     last_run_at = EXCLUDED.last_run_at
                 """,
                 session_id,
                 to_seq,
-                last_run_at,
+                _to_datetime(last_run_at),
             )
 
 
@@ -208,7 +257,7 @@ class AsyncpgPurposeStore:
                 INSERT INTO session_purposes (
                     session_id, purpose, domain_tags, success_score, polluted,
                     pollution_reason, derived_from_version, derived_at, last_updated_at
-                ) VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8::timestamptz, $9::timestamptz)
+                ) VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (session_id) DO UPDATE SET
                     purpose = EXCLUDED.purpose,
                     domain_tags = EXCLUDED.domain_tags,
@@ -226,8 +275,8 @@ class AsyncpgPurposeStore:
                 purpose.polluted,
                 purpose.pollution_reason,
                 purpose.derived_from_version,
-                purpose.derived_at or _now_iso(),
-                purpose.last_updated_at or _now_iso(),
+                _to_datetime(purpose.derived_at),
+                _to_datetime(purpose.last_updated_at),
             )
 
     async def get(self, session_id: str) -> SessionPurpose | None:
@@ -265,7 +314,7 @@ class AsyncpgDigestStore:
                 INSERT INTO session_digests (
                     digest_id, session_id, version_id, summary_md, bm25_text,
                     embedding, extracted_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
                 digest.digest_id,
                 digest.session_id,
@@ -273,7 +322,7 @@ class AsyncpgDigestStore:
                 digest.summary_md,
                 digest.bm25_text,
                 list(embedding),
-                digest.extracted_at or _now_iso(),
+                _to_datetime(digest.extracted_at),
             )
 
     async def get(self, session_id: str) -> SessionDigest | None:
@@ -306,8 +355,8 @@ class AsyncpgLearningStore:
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7::jsonb,
                     $8, $9, $10, $11,
-                    $12::timestamptz, $13, $14, $15,
-                    $16::timestamptz, $17::timestamptz
+                    $12, $13, $14, $15,
+                    $16, $17
                 )
                 """,
                 learning.learning_id,
@@ -321,12 +370,12 @@ class AsyncpgLearningStore:
                 learning.source_version,
                 learning.evidence_count,
                 learning.confidence,
-                learning.archived_at,
+                _to_optional_datetime(learning.archived_at),
                 learning.superseded_by,
                 learning.bm25_text,
                 list(embedding),
-                learning.created_at or _now_iso(),
-                learning.updated_at or _now_iso(),
+                _to_datetime(learning.created_at),
+                _to_datetime(learning.updated_at),
             )
 
     async def get(self, learning_id: str) -> Learning | None:
@@ -356,7 +405,7 @@ class AsyncpgLearningStore:
                     why = $3,
                     evidence_count = $4,
                     bm25_text = $5,
-                    updated_at = $6::timestamptz,
+                    updated_at = $6,
                     embedding = $7
                 WHERE learning_id = $1
                 """,
@@ -365,7 +414,7 @@ class AsyncpgLearningStore:
                 why,
                 evidence_count,
                 bm25_text,
-                updated_at,
+                _to_datetime(updated_at),
                 list(embedding),
             )
 
@@ -374,13 +423,13 @@ class AsyncpgLearningStore:
             await conn.execute(
                 """
                 UPDATE learnings SET
-                    archived_at = $2::timestamptz,
+                    archived_at = $2,
                     superseded_by = $3,
-                    updated_at = $2::timestamptz
+                    updated_at = $2
                 WHERE learning_id = $1
                 """,
                 old_id,
-                archived_at,
+                _to_datetime(archived_at),
                 new_id,
             )
 
@@ -464,14 +513,6 @@ class AsyncpgLearningStore:
                 )
             )
         return tuple(hits)
-
-
-def _now_iso() -> str:
-    """Fallback ISO-8601 UTC timestamp for rows that arrived without one."""
-
-    from datetime import UTC, datetime
-
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 __all__ = [
