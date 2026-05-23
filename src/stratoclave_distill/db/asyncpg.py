@@ -110,10 +110,12 @@ async def pool_context(
 
 
 def _row_to_purpose(row: Any) -> SessionPurpose:
+    tags_raw = row["domain_tags"]
+    tags = json.loads(tags_raw) if isinstance(tags_raw, str) else (tags_raw or [])
     return SessionPurpose(
         session_id=str(row["session_id"]),
         purpose=row["purpose"],
-        domain_tags=tuple(row["domain_tags"] or ()),
+        domain_tags=tuple(tags),
         success_score=row["success_score"],
         polluted=bool(row["polluted"]),
         pollution_reason=row["pollution_reason"],
