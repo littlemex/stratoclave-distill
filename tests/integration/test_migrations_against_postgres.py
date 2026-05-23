@@ -8,10 +8,10 @@ fast and dependency-free. Run locally with::
         pytest -m integration
 
 The test runs ``alembic upgrade head`` then introspects the schema via
-``information_schema`` to confirm every required table and pgvector index
-landed, then runs ``alembic downgrade base`` and checks the schema is gone.
-This is the gate that proves Stage A's persistence layer actually works
-before Stage B's Distiller starts using it.
+``information_schema`` to confirm every required table, column, and
+pgvector / GIN index landed, then runs ``alembic downgrade base`` and
+checks the schema is gone. This is the gate that proves both 0001 and
+0002 actually apply cleanly before the pipeline starts using them.
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ REQUIRED_TABLES = {
     "learnings",
     "distill_watermarks",
     "group_learnings",
+    "learning_conflicts",
+    "session_gaps",
 }
 
 REQUIRED_INDEXES = {
@@ -40,9 +42,28 @@ REQUIRED_INDEXES = {
     "idx_learnings_bm25",
     "idx_group_learnings_vec",
     "idx_group_learnings_bm25",
+    "idx_session_purposes_parent",
+    "idx_session_purposes_branch_state",
+    "learning_conflicts_from_idx",
+    "learning_conflicts_to_idx",
+    "learning_conflicts_unresolved",
+    "session_gaps_session_idx",
+    "session_gaps_unresolved",
+    "session_gaps_bm25_idx",
 }
 
 REQUIRED_EXTENSIONS = {"vector", "pg_trgm"}
+
+REQUIRED_NEW_COLUMNS = {
+    "session_purposes": {
+        "parent_session_id",
+        "branched_at_seq",
+        "branch_kind",
+        "branch_state",
+        "closed_at",
+    },
+    "learnings": {"claim_type"},
+}
 
 
 def _database_url() -> str | None:
@@ -109,6 +130,32 @@ def test_migration_creates_and_drops_all_tables(db_url: str) -> None:
             assert row is not None and row[0] == "hnsw", (
                 "vector index must use the HNSW access method"
             )
+
+            for table, columns in REQUIRED_NEW_COLUMNS.items():
+                cur.execute(
+                    """
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = %s
+                    """,
+                    (table,),
+                )
+                actual = {row[0] for row in cur.fetchall()}
+                for col in columns:
+                    assert col in actual, f"missing column {table}.{col}"
+
+            cur.execute(
+                """
+                SELECT pg_get_constraintdef(c.oid)
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                WHERE t.relname = 'learnings' AND c.conname = 'learnings_scope_check'
+                """
+            )
+            row = cur.fetchone()
+            assert row is not None, "learnings_scope_check constraint missing"
+            assert "experiment" in row[0], (
+                "learnings_scope_check must include the 'experiment' scope after 0002"
+            )
     finally:
         _run_alembic("down", db_url)
         with psycopg.connect(sync_url) as conn, conn.cursor() as cur:
@@ -117,4 +164,6 @@ def test_migration_creates_and_drops_all_tables(db_url: str) -> None:
             )
             tables_after = {row[0] for row in cur.fetchall()}
             for required in REQUIRED_TABLES:
-                assert required not in tables_after, f"downgrade left {required!r} behind"
+                assert required not in tables_after, (
+                    f"downgrade left {required!r} behind"
+                )
