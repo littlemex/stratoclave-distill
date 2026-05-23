@@ -290,3 +290,104 @@ def test_branch_list_rejects_both_tree_and_json(
     rc = main(["branch", "list", "--tree", "--json"])
     assert rc == 2
     assert "mutually exclusive" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Stage C: query subcommand
+# --------------------------------------------------------------------------
+
+
+def test_query_dry_run_emits_empty_lanes_as_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["query", "flaky tests", "--dry-run"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["query_text"] == "flaky tests"
+    assert payload["canonical"] == []
+    assert payload["emerging"] == []
+    assert payload["conflicts"] == []
+    assert payload["gaps"] == []
+
+
+def test_query_dry_run_pack_emits_markdown(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(
+        [
+            "query",
+            "flaky tests",
+            "--dry-run",
+            "--pack",
+            "--token-budget",
+            "200",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Title + query echo are rendered even when both lanes are empty.
+    assert out.startswith("# Distilled context\n")
+    assert "_query_: flaky tests" in out
+
+
+def test_query_rejects_zero_limit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["query", "anything", "--dry-run", "--limit", "0"])
+    assert rc == 2
+    assert "--limit must be" in capsys.readouterr().err
+
+
+def test_query_lane_filter_canonical_only_drops_emerging(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["query", "x", "--dry-run", "--lane", "canonical"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["canonical"] == []
+    assert payload["emerging"] == []
+
+
+def test_query_prod_path_requires_database_url(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    rc = main(["query", "anything"])
+    assert rc == 2
+    assert "DATABASE_URL is required" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Stage C: export subcommand
+# --------------------------------------------------------------------------
+
+
+def test_export_requires_database_url(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    rc = main(["export", "s-1"])
+    assert rc == 2
+    assert "DATABASE_URL is required" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Stage C: gc subcommand
+# --------------------------------------------------------------------------
+
+
+def test_gc_rejects_negative_age(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["gc", "--older-than-days", "-1"])
+    assert rc == 2
+    assert "must be" in capsys.readouterr().err
+
+
+def test_gc_requires_database_url(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    rc = main(["gc"])
+    assert rc == 2
+    assert "DATABASE_URL is required" in capsys.readouterr().err

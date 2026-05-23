@@ -215,6 +215,74 @@ stratoclave-distill branch list --json | jq .
 See `docs/STAGE_B_PLUS_DESIGN.md` for the full design (data model,
 claim_type taxonomy, conflict / gap relations, retrieval lanes).
 
+## Query / Pack / Export / GC (Stage C)
+
+Stage C exposes the existing `Retriever` and the new `ContextPacker`
+through three CLI subcommands plus an archive cleanup helper.
+
+### `query`: hybrid retrieval
+
+The default form returns the canonical and emerging lanes plus any
+open conflicts and gaps as a single JSON document:
+
+```bash
+stratoclave-distill query "what should we do about flaky tests?" \
+  --lane both --limit 5
+```
+
+`--dry-run` short-circuits without touching the database, which is
+useful for shaping templates around an empty result:
+
+```bash
+stratoclave-distill query "demo query" --dry-run
+```
+
+`--pack` swaps the JSON output for a Markdown bundle that respects a
+token budget. Hits are grouped by lane (canonical → emerging) and
+within each lane by `claim_type` (`norm` → `observation` →
+`interpretation` → `signal`). Pass `--token-budget` to override the
+configured `context_budget_default` (defaults to 2000):
+
+```bash
+stratoclave-distill query "flaky tests" --pack --token-budget 1500
+```
+
+The token counter is a deliberate `ceil(len/4)` approximation to keep
+the runtime free of `tiktoken`. Wrap `ContextPacker(token_counter=...)`
+from Python if you need byte-accurate counts.
+
+### `export`: dump a session
+
+`export` is the operator-facing session inspector. It prints purpose,
+digest, and learnings as a single JSON payload. Add
+`--include-archived` to surface superseded learnings or
+`--include-side-relations` to surface conflicts and gaps anchored to
+the session:
+
+```bash
+stratoclave-distill export s-123 \
+  --include-archived \
+  --include-side-relations \
+  | jq .
+```
+
+### `gc`: archive cleanup (dry-run by default)
+
+`gc` reports how many archived (`archived_at IS NOT NULL`) learnings
+older than `--older-than-days` (default 90) would be deleted. The
+destructive `DELETE` only runs when you pass `--apply` explicitly:
+
+```bash
+# Survey only — no rows are removed:
+stratoclave-distill gc --older-than-days 30
+
+# Actually delete:
+stratoclave-distill gc --older-than-days 30 --apply
+```
+
+Negative ages are rejected at parse time, and the JSON output always
+echoes the `dry_run` flag so cron jobs can audit their own behavior.
+
 ## Troubleshooting
 
 ### `ModuleNotFoundError: stratoclave_distill`
