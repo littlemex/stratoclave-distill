@@ -460,3 +460,69 @@ async def test_distill_falls_back_to_placeholder_for_empty_digest() -> None:
     distiller, _, embedder = _make(json.dumps(payload))
     await distiller.distill([_turn(0)], session_id="s-1")
     assert embedder.calls[0] == ("(empty)",)
+
+
+# --------------------------------------------------------------------------
+# Stage B+ claim_type and experiment scope
+# --------------------------------------------------------------------------
+
+
+def test_distill_system_prompt_documents_claim_type_vocabulary() -> None:
+    msgs = build_distill_prompt([_turn(0)], session_id="s-1", prior_purpose=None)
+    system = msgs[0].content
+    assert "claim_type" in system
+    for fragment in ("observation", "interpretation", "signal", "norm"):
+        assert fragment in system, f"system prompt missing claim_type value {fragment!r}"
+    assert "experiment" in system, "system prompt must list 'experiment' scope"
+
+
+@pytest.mark.asyncio
+async def test_distill_extracts_claim_type_when_present() -> None:
+    bad = _default_learnings()
+    bad[0]["claim_type"] = "norm"
+    distiller, _, _ = _make(_payload(learnings=bad))
+    result = await distiller.distill([_turn(0)], session_id="s-1")
+    assert result.candidate_learnings[0].learning.claim_type == "norm"
+
+
+@pytest.mark.asyncio
+async def test_distill_defaults_claim_type_to_signal_when_omitted() -> None:
+    """Existing prompts that pre-date claim_type still parse cleanly.
+
+    When the LLM does not emit ``claim_type`` we silently default to
+    ``signal``. The retriever falls back to signal semantics for legacy
+    rows so this matches the behaviour the data already implies.
+    """
+
+    distiller, _, _ = _make(_payload())  # _default_learnings has no claim_type
+    result = await distiller.distill([_turn(0)], session_id="s-1")
+    assert result.candidate_learnings[0].learning.claim_type == "signal"
+
+
+@pytest.mark.asyncio
+async def test_distill_rejects_unknown_claim_type() -> None:
+    bad = _default_learnings()
+    bad[0]["claim_type"] = "rumor"
+    distiller, _, _ = _make(_payload(learnings=bad))
+    with pytest.raises(LLMError, match=r"'claim_type' must be one of"):
+        await distiller.distill([_turn(0)], session_id="s-1")
+
+
+@pytest.mark.asyncio
+async def test_distill_rejects_non_string_claim_type() -> None:
+    bad = _default_learnings()
+    bad[0]["claim_type"] = 42
+    distiller, _, _ = _make(_payload(learnings=bad))
+    with pytest.raises(LLMError, match=r"'claim_type' must be a string or null"):
+        await distiller.distill([_turn(0)], session_id="s-1")
+
+
+@pytest.mark.asyncio
+async def test_distill_accepts_experiment_scope() -> None:
+    """Stage B+ widens the scope vocabulary to include ``experiment``."""
+
+    bad = _default_learnings()
+    bad[0]["scope"] = "experiment"
+    distiller, _, _ = _make(_payload(learnings=bad))
+    result = await distiller.distill([_turn(0)], session_id="s-1")
+    assert result.candidate_learnings[0].learning.scope == "experiment"

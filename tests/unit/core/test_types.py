@@ -23,8 +23,10 @@ from stratoclave_distill import (
     EmbeddingRecord,
     GroupLearning,
     Learning,
+    LearningConflict,
     NormalizedTurn,
     SessionDigest,
+    SessionGap,
     SessionPurpose,
 )
 
@@ -33,6 +35,8 @@ ALL_PUBLIC_TYPES = (
     SessionPurpose,
     SessionDigest,
     Learning,
+    LearningConflict,
+    SessionGap,
     GroupLearning,
     EmbeddingRecord,
     ContextPackItem,
@@ -75,6 +79,25 @@ def test_session_purpose_defaults_are_safe() -> None:
     assert purpose.domain_tags == ()
     assert purpose.success_score is None
     assert purpose.polluted is False
+    assert purpose.parent_session_id is None
+    assert purpose.branched_at_seq is None
+    assert purpose.branch_kind == "main"
+    assert purpose.branch_state == "open"
+    assert purpose.closed_at is None
+
+
+def test_session_purpose_accepts_branching_topology() -> None:
+    purpose = SessionPurpose(
+        session_id="s-2",
+        purpose="experiment with new prompt",
+        parent_session_id="s-1",
+        branched_at_seq=12,
+        branch_kind="experiment",
+        branch_state="open",
+    )
+    assert purpose.parent_session_id == "s-1"
+    assert purpose.branched_at_seq == 12
+    assert purpose.branch_kind == "experiment"
 
 
 def test_learning_evidence_count_starts_at_one() -> None:
@@ -87,6 +110,42 @@ def test_learning_evidence_count_starts_at_one() -> None:
     assert learning.evidence_count == 1
     assert learning.confidence == pytest.approx(0.5)
     assert learning.archived_at is None
+    assert learning.claim_type is None
+
+
+def test_learning_accepts_claim_type_and_experiment_scope() -> None:
+    learning = Learning(
+        learning_id="l-2",
+        scope="experiment",
+        rule="try new retry policy",
+        why="testing under sustained 503",
+        claim_type="signal",
+    )
+    assert learning.scope == "experiment"
+    assert learning.claim_type == "signal"
+
+
+def test_learning_conflict_round_trips_minimal_fields() -> None:
+    conflict = LearningConflict(
+        conflict_id="c-1",
+        from_id="l-1",
+        to_id="l-2",
+        reason="contradictory retry counts",
+        cosine_at_detection=0.82,
+    )
+    assert conflict.resolution == "open"
+    assert conflict.cosine_at_detection == pytest.approx(0.82)
+
+
+def test_session_gap_defaults() -> None:
+    gap = SessionGap(
+        gap_id="g-1",
+        session_id="s-1",
+        topic="why does the agent loop on tool errors",
+        why_unknown="no observable retry budget",
+    )
+    assert gap.resolved_at is None
+    assert gap.resolved_by_learning is None
 
 
 def test_context_pack_to_markdown_returns_markdown_attribute() -> None:

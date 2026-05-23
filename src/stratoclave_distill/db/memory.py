@@ -25,15 +25,33 @@ import asyncio
 import math
 import re
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 
 from stratoclave_distill.core.errors import EmbeddingError
 from stratoclave_distill.core.types import (
+    BranchState,
+    ConflictResolution,
     Learning,
+    LearningConflict,
     LearningScope,
     SessionDigest,
+    SessionGap,
     SessionPurpose,
 )
-from stratoclave_distill.db.stores import LearningSearchHit
+from stratoclave_distill.db.stores import LearningSearchHit, RetrievalLane
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 ``...Z`` timestamp; return ``None`` for empty / None."""
+
+    if not value:
+        return None
+    text = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _norm(vec: Sequence[float]) -> float:
@@ -110,7 +128,12 @@ class InMemoryWatermarkStore:
 
 
 class InMemoryPurposeStore:
-    """Single-row-per-session :class:`SessionPurpose` store."""
+    """Single-row-per-session :class:`SessionPurpose` store.
+
+    Stage B+ exposes branch lifecycle helpers
+    (:meth:`set_branch_state`, :meth:`list_branches`) so the CLI can
+    transition open / closed / promoted without reissuing a full upsert.
+    """
 
     __slots__ = ("_lock", "_rows")
 
@@ -125,6 +148,47 @@ class InMemoryPurposeStore:
     async def get(self, session_id: str) -> SessionPurpose | None:
         async with self._lock:
             return self._rows.get(session_id)
+
+    async def set_branch_state(
+        self,
+        session_id: str,
+        *,
+        branch_state: BranchState,
+        closed_at: str | None,
+        last_updated_at: str,
+    ) -> None:
+        async with self._lock:
+            row = self._rows.get(session_id)
+            if row is None:
+                return
+            self._rows[session_id] = SessionPurpose(
+                session_id=row.session_id,
+                purpose=row.purpose,
+                domain_tags=row.domain_tags,
+                success_score=row.success_score,
+                polluted=row.polluted,
+                pollution_reason=row.pollution_reason,
+                derived_from_version=row.derived_from_version,
+                derived_at=row.derived_at,
+                last_updated_at=last_updated_at,
+                parent_session_id=row.parent_session_id,
+                branched_at_seq=row.branched_at_seq,
+                branch_kind=row.branch_kind,
+                branch_state=branch_state,
+                closed_at=closed_at,
+            )
+
+    async def list_branches(
+        self,
+        *,
+        parent_session_id: str | None = None,
+    ) -> Sequence[SessionPurpose]:
+        async with self._lock:
+            if parent_session_id is None:
+                return tuple(self._rows.values())
+            return tuple(
+                row for row in self._rows.values() if row.parent_session_id == parent_session_id
+            )
 
 
 class InMemoryDigestStore:
@@ -212,6 +276,7 @@ class InMemoryLearningStore:
                 bm25_text=bm25_text,
                 created_at=row.created_at,
                 updated_at=updated_at,
+                claim_type=row.claim_type,
             )
             self._rows[learning_id] = new
             self._embeddings[learning_id] = tuple(embedding)
@@ -239,6 +304,7 @@ class InMemoryLearningStore:
                 bm25_text=old.bm25_text,
                 created_at=old.created_at,
                 updated_at=archived_at,
+                claim_type=old.claim_type,
             )
 
     async def list_active(self, *, scope: LearningScope | None = None) -> Sequence[Learning]:
@@ -257,12 +323,33 @@ class InMemoryLearningStore:
         top_k: int = 10,
         rrf_k: int = 60,
         scope: LearningScope | None = None,
+        lane: RetrievalLane = "all",
+        canonical_min_evidence: int = 3,
+        canonical_min_age_days: int = 14,
     ) -> Sequence[LearningSearchHit]:
+        cutoff = datetime.now(UTC) - timedelta(days=canonical_min_age_days)
+
+        def _row_in_lane(row: Learning) -> bool:
+            if lane == "all":
+                return True
+            created = _parse_iso(row.created_at)
+            is_canonical = (
+                row.evidence_count >= canonical_min_evidence
+                and created is not None
+                and created <= cutoff
+                and row.scope != "experiment"
+            )
+            if lane == "canonical":
+                return is_canonical
+            return not is_canonical
+
         async with self._lock:
             active = [
                 (lid, row)
                 for lid, row in self._rows.items()
-                if row.archived_at is None and (scope is None or row.scope == scope)
+                if row.archived_at is None
+                and (scope is None or row.scope == scope)
+                and _row_in_lane(row)
             ]
             if not active:
                 return ()
@@ -308,8 +395,110 @@ class InMemoryLearningStore:
         return tuple(hits[:top_k])
 
 
+class InMemoryConflictStore:
+    """In-memory :class:`ConflictStore` keyed by ``conflict_id``."""
+
+    __slots__ = ("_lock", "_rows")
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._rows: dict[str, LearningConflict] = {}
+
+    async def insert(self, conflict: LearningConflict) -> None:
+        async with self._lock:
+            self._rows[conflict.conflict_id] = conflict
+
+    async def get(self, conflict_id: str) -> LearningConflict | None:
+        async with self._lock:
+            return self._rows.get(conflict_id)
+
+    async def list_open(self) -> Sequence[LearningConflict]:
+        async with self._lock:
+            return tuple(c for c in self._rows.values() if c.resolution == "open")
+
+    async def list_for(self, learning_id: str) -> Sequence[LearningConflict]:
+        async with self._lock:
+            return tuple(
+                c for c in self._rows.values() if c.from_id == learning_id or c.to_id == learning_id
+            )
+
+    async def resolve(
+        self,
+        conflict_id: str,
+        *,
+        resolution: ConflictResolution,
+    ) -> None:
+        async with self._lock:
+            row = self._rows.get(conflict_id)
+            if row is None:
+                return
+            self._rows[conflict_id] = LearningConflict(
+                conflict_id=row.conflict_id,
+                from_id=row.from_id,
+                to_id=row.to_id,
+                reason=row.reason,
+                cosine_at_detection=row.cosine_at_detection,
+                detected_at=row.detected_at,
+                resolution=resolution,
+            )
+
+
+class InMemoryGapStore:
+    """In-memory :class:`GapStore` keyed by ``gap_id``."""
+
+    __slots__ = ("_lock", "_rows")
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._rows: dict[str, SessionGap] = {}
+
+    async def insert(self, gap: SessionGap) -> None:
+        async with self._lock:
+            self._rows[gap.gap_id] = gap
+
+    async def get(self, gap_id: str) -> SessionGap | None:
+        async with self._lock:
+            return self._rows.get(gap_id)
+
+    async def list_unresolved(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> Sequence[SessionGap]:
+        async with self._lock:
+            return tuple(
+                g
+                for g in self._rows.values()
+                if g.resolved_at is None and (session_id is None or g.session_id == session_id)
+            )
+
+    async def resolve(
+        self,
+        gap_id: str,
+        *,
+        resolved_at: str,
+        resolved_by_learning: str | None,
+    ) -> None:
+        async with self._lock:
+            row = self._rows.get(gap_id)
+            if row is None:
+                return
+            self._rows[gap_id] = SessionGap(
+                gap_id=row.gap_id,
+                session_id=row.session_id,
+                topic=row.topic,
+                why_unknown=row.why_unknown,
+                bm25_text=row.bm25_text,
+                detected_at=row.detected_at,
+                resolved_at=resolved_at,
+                resolved_by_learning=resolved_by_learning,
+            )
+
+
 __all__ = [
+    "InMemoryConflictStore",
     "InMemoryDigestStore",
+    "InMemoryGapStore",
     "InMemoryLearningStore",
     "InMemoryPurposeStore",
     "InMemoryWatermarkStore",

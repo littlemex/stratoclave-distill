@@ -6,6 +6,8 @@ and Curator land alongside it as their implementations are completed.
 """
 
 from stratoclave_distill.pipeline.curator import (
+    ConflictJudge,
+    ConflictVerdict,
     CurationAction,
     CurationOutcome,
     Curator,
@@ -18,6 +20,7 @@ from stratoclave_distill.pipeline.distiller import (
     build_distill_prompt,
 )
 from stratoclave_distill.pipeline.ingest import (
+    BranchPlan,
     IngestReport,
     IngestRunner,
     SessionIngestResult,
@@ -25,7 +28,10 @@ from stratoclave_distill.pipeline.ingest import (
 from stratoclave_distill.pipeline.reader import JsonlSessionReader, SkippedLine
 
 __all__ = [
+    "BranchPlan",
     "CandidateLearning",
+    "ConflictJudge",
+    "ConflictVerdict",
     "CurationAction",
     "CurationOutcome",
     "Curator",

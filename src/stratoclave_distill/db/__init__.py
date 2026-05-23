@@ -9,27 +9,37 @@ use and is exercised by the integration tests.
 """
 
 from stratoclave_distill.db.memory import (
+    InMemoryConflictStore,
     InMemoryDigestStore,
+    InMemoryGapStore,
     InMemoryLearningStore,
     InMemoryPurposeStore,
     InMemoryWatermarkStore,
 )
 from stratoclave_distill.db.stores import (
+    ConflictStore,
     DigestStore,
+    GapStore,
     LearningSearchHit,
     LearningStore,
     PurposeStore,
+    RetrievalLane,
     WatermarkStore,
 )
 
 __all__ = [
+    "ConflictStore",
     "DigestStore",
+    "GapStore",
+    "InMemoryConflictStore",
     "InMemoryDigestStore",
+    "InMemoryGapStore",
     "InMemoryLearningStore",
     "InMemoryPurposeStore",
     "InMemoryWatermarkStore",
     "LearningSearchHit",
     "LearningStore",
     "PurposeStore",
+    "RetrievalLane",
     "WatermarkStore",
 ]

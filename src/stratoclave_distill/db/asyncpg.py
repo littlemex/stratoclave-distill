@@ -35,12 +35,16 @@ from typing import Any
 
 from stratoclave_distill.core.errors import ConfigError
 from stratoclave_distill.core.types import (
+    BranchState,
+    ConflictResolution,
     Learning,
+    LearningConflict,
     LearningScope,
     SessionDigest,
+    SessionGap,
     SessionPurpose,
 )
-from stratoclave_distill.db.stores import LearningSearchHit
+from stratoclave_distill.db.stores import LearningSearchHit, RetrievalLane
 
 
 def _normalize_dsn(database_url: str) -> str:
@@ -161,6 +165,7 @@ def _from_optional_datetime(value: datetime | None) -> str | None:
 def _row_to_purpose(row: Any) -> SessionPurpose:
     tags_raw = row["domain_tags"]
     tags = json.loads(tags_raw) if isinstance(tags_raw, str) else (tags_raw or [])
+    parent_raw = row.get("parent_session_id", None)
     return SessionPurpose(
         session_id=str(row["session_id"]),
         purpose=row["purpose"],
@@ -171,6 +176,11 @@ def _row_to_purpose(row: Any) -> SessionPurpose:
         derived_from_version=row["derived_from_version"],
         derived_at=_from_datetime(row["derived_at"]),
         last_updated_at=_from_datetime(row["last_updated_at"]),
+        parent_session_id=str(parent_raw) if parent_raw is not None else None,
+        branched_at_seq=row.get("branched_at_seq", None),
+        branch_kind=row.get("branch_kind", "main"),
+        branch_state=row.get("branch_state", "open"),
+        closed_at=_from_optional_datetime(row["closed_at"]) if "closed_at" in row else None,
     )
 
 
@@ -188,6 +198,7 @@ def _row_to_digest(row: Any) -> SessionDigest:
 def _row_to_learning(row: Any) -> Learning:
     triggers_raw = row["triggers"]
     triggers = json.loads(triggers_raw) if isinstance(triggers_raw, str) else triggers_raw or {}
+    claim_type_raw = row.get("claim_type", None)
     return Learning(
         learning_id=str(row["learning_id"]),
         scope=row["scope"],
@@ -205,6 +216,34 @@ def _row_to_learning(row: Any) -> Learning:
         bm25_text=row["bm25_text"],
         created_at=_from_datetime(row["created_at"]),
         updated_at=_from_datetime(row["updated_at"]),
+        claim_type=claim_type_raw,
+    )
+
+
+def _row_to_conflict(row: Any) -> LearningConflict:
+    return LearningConflict(
+        conflict_id=str(row["conflict_id"]),
+        from_id=str(row["from_id"]),
+        to_id=str(row["to_id"]),
+        reason=row["reason"],
+        cosine_at_detection=float(row["cosine_at_detection"]),
+        detected_at=_from_datetime(row["detected_at"]),
+        resolution=row["resolution"],
+    )
+
+
+def _row_to_gap(row: Any) -> SessionGap:
+    return SessionGap(
+        gap_id=str(row["gap_id"]),
+        session_id=str(row["session_id"]),
+        topic=row["topic"],
+        why_unknown=row["why_unknown"],
+        bm25_text=row["bm25_text"],
+        detected_at=_from_datetime(row["detected_at"]),
+        resolved_at=_from_optional_datetime(row["resolved_at"]),
+        resolved_by_learning=(
+            str(row["resolved_by_learning"]) if row["resolved_by_learning"] is not None else None
+        ),
     )
 
 
@@ -256,8 +295,13 @@ class AsyncpgPurposeStore:
                 """
                 INSERT INTO session_purposes (
                     session_id, purpose, domain_tags, success_score, polluted,
-                    pollution_reason, derived_from_version, derived_at, last_updated_at
-                ) VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9)
+                    pollution_reason, derived_from_version, derived_at, last_updated_at,
+                    parent_session_id, branched_at_seq, branch_kind, branch_state, closed_at
+                ) VALUES (
+                    $1, $2, $3::jsonb, $4, $5,
+                    $6, $7, $8, $9,
+                    $10, $11, $12, $13, $14
+                )
                 ON CONFLICT (session_id) DO UPDATE SET
                     purpose = EXCLUDED.purpose,
                     domain_tags = EXCLUDED.domain_tags,
@@ -266,7 +310,12 @@ class AsyncpgPurposeStore:
                     pollution_reason = EXCLUDED.pollution_reason,
                     derived_from_version = EXCLUDED.derived_from_version,
                     derived_at = EXCLUDED.derived_at,
-                    last_updated_at = EXCLUDED.last_updated_at
+                    last_updated_at = EXCLUDED.last_updated_at,
+                    parent_session_id = EXCLUDED.parent_session_id,
+                    branched_at_seq = EXCLUDED.branched_at_seq,
+                    branch_kind = EXCLUDED.branch_kind,
+                    branch_state = EXCLUDED.branch_state,
+                    closed_at = EXCLUDED.closed_at
                 """,
                 purpose.session_id,
                 purpose.purpose,
@@ -277,6 +326,11 @@ class AsyncpgPurposeStore:
                 purpose.derived_from_version,
                 _to_datetime(purpose.derived_at),
                 _to_datetime(purpose.last_updated_at),
+                purpose.parent_session_id,
+                purpose.branched_at_seq,
+                purpose.branch_kind,
+                purpose.branch_state,
+                _to_optional_datetime(purpose.closed_at),
             )
 
     async def get(self, session_id: str) -> SessionPurpose | None:
@@ -286,6 +340,45 @@ class AsyncpgPurposeStore:
                 session_id,
             )
         return _row_to_purpose(row) if row is not None else None
+
+    async def set_branch_state(
+        self,
+        session_id: str,
+        *,
+        branch_state: BranchState,
+        closed_at: str | None,
+        last_updated_at: str,
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE session_purposes
+                SET branch_state = $2,
+                    closed_at = $3,
+                    last_updated_at = $4
+                WHERE session_id = $1
+                """,
+                session_id,
+                branch_state,
+                _to_optional_datetime(closed_at),
+                _to_datetime(last_updated_at),
+            )
+
+    async def list_branches(
+        self,
+        *,
+        parent_session_id: str | None = None,
+    ) -> Sequence[SessionPurpose]:
+        async with self._pool.acquire() as conn:
+            if parent_session_id is None:
+                rows = await conn.fetch("SELECT * FROM session_purposes ORDER BY derived_at")
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM session_purposes "
+                    "WHERE parent_session_id = $1 ORDER BY derived_at",
+                    parent_session_id,
+                )
+        return tuple(_row_to_purpose(r) for r in rows)
 
 
 class AsyncpgDigestStore:
@@ -351,12 +444,12 @@ class AsyncpgLearningStore:
                     learning_id, scope, project_key, group_id, rule, why, triggers,
                     source_session, source_version, evidence_count, confidence,
                     archived_at, superseded_by, bm25_text, embedding,
-                    created_at, updated_at
+                    created_at, updated_at, claim_type
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7::jsonb,
                     $8, $9, $10, $11,
                     $12, $13, $14, $15,
-                    $16, $17
+                    $16, $17, $18
                 )
                 """,
                 learning.learning_id,
@@ -376,6 +469,7 @@ class AsyncpgLearningStore:
                 list(embedding),
                 _to_datetime(learning.created_at),
                 _to_datetime(learning.updated_at),
+                learning.claim_type,
             )
 
     async def get(self, learning_id: str) -> Learning | None:
@@ -452,18 +546,42 @@ class AsyncpgLearningStore:
         top_k: int = 10,
         rrf_k: int = 60,
         scope: LearningScope | None = None,
+        lane: RetrievalLane = "all",
+        canonical_min_evidence: int = 3,
+        canonical_min_age_days: int = 14,
     ) -> Sequence[LearningSearchHit]:
         # We pass the vector as a list[float]; pgvector codec converts.
         # ``ts_rank_cd`` is positive when there is any token overlap;
         # rows with no BM25 hit get ``bm25_rank = NULL`` so the Curator
         # can distinguish "vector-only" matches.
-        scope_filter = "AND scope = $4" if scope is not None else ""
+        params: list[Any] = [list(query_vector), query_text, rrf_k]
+        scope_filter = ""
+        if scope is not None:
+            params.append(scope)
+            scope_filter = f"AND scope = ${len(params)}"
+
+        lane_filter = ""
+        if lane != "all":
+            params.append(canonical_min_evidence)
+            min_ev_idx = len(params)
+            params.append(canonical_min_age_days)
+            min_age_idx = len(params)
+            canonical_pred = (
+                f"(evidence_count >= ${min_ev_idx} "
+                f"AND created_at <= now() - make_interval(days => ${min_age_idx}) "
+                "AND scope <> 'experiment')"
+            )
+            lane_filter = (
+                f"AND {canonical_pred}" if lane == "canonical" else f"AND NOT {canonical_pred}"
+            )
+
         sql = f"""
         WITH active AS (
             SELECT learning_id, embedding, bm25_tsv, bm25_text
             FROM learnings
             WHERE archived_at IS NULL
             {scope_filter}
+            {lane_filter}
         ),
         vec AS (
             SELECT learning_id,
@@ -496,9 +614,6 @@ class AsyncpgLearningStore:
         ORDER BY f.rrf DESC
         LIMIT {int(top_k)}
         """
-        params: list[Any] = [list(query_vector), query_text, rrf_k]
-        if scope is not None:
-            params.append(scope)
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         hits: list[LearningSearchHit] = []
@@ -515,8 +630,148 @@ class AsyncpgLearningStore:
         return tuple(hits)
 
 
+class AsyncpgConflictStore:
+    """asyncpg-backed :class:`ConflictStore`."""
+
+    __slots__ = ("_pool",)
+
+    def __init__(self, pool: Any) -> None:
+        self._pool = pool
+
+    async def insert(self, conflict: LearningConflict) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO learning_conflicts (
+                    conflict_id, from_id, to_id, reason, cosine_at_detection,
+                    detected_at, resolution
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                conflict.conflict_id,
+                conflict.from_id,
+                conflict.to_id,
+                conflict.reason,
+                conflict.cosine_at_detection,
+                _to_datetime(conflict.detected_at),
+                conflict.resolution,
+            )
+
+    async def get(self, conflict_id: str) -> LearningConflict | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM learning_conflicts WHERE conflict_id = $1",
+                conflict_id,
+            )
+        return _row_to_conflict(row) if row is not None else None
+
+    async def list_open(self) -> Sequence[LearningConflict]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM learning_conflicts WHERE resolution = 'open' ORDER BY detected_at"
+            )
+        return tuple(_row_to_conflict(r) for r in rows)
+
+    async def list_for(self, learning_id: str) -> Sequence[LearningConflict]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM learning_conflicts "
+                "WHERE from_id = $1 OR to_id = $1 ORDER BY detected_at",
+                learning_id,
+            )
+        return tuple(_row_to_conflict(r) for r in rows)
+
+    async def resolve(
+        self,
+        conflict_id: str,
+        *,
+        resolution: ConflictResolution,
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE learning_conflicts SET resolution = $2 WHERE conflict_id = $1",
+                conflict_id,
+                resolution,
+            )
+
+
+class AsyncpgGapStore:
+    """asyncpg-backed :class:`GapStore`."""
+
+    __slots__ = ("_pool",)
+
+    def __init__(self, pool: Any) -> None:
+        self._pool = pool
+
+    async def insert(self, gap: SessionGap) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO session_gaps (
+                    gap_id, session_id, topic, why_unknown, bm25_text,
+                    detected_at, resolved_at, resolved_by_learning
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                gap.gap_id,
+                gap.session_id,
+                gap.topic,
+                gap.why_unknown,
+                gap.bm25_text,
+                _to_datetime(gap.detected_at),
+                _to_optional_datetime(gap.resolved_at),
+                gap.resolved_by_learning,
+            )
+
+    async def get(self, gap_id: str) -> SessionGap | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM session_gaps WHERE gap_id = $1",
+                gap_id,
+            )
+        return _row_to_gap(row) if row is not None else None
+
+    async def list_unresolved(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> Sequence[SessionGap]:
+        async with self._pool.acquire() as conn:
+            if session_id is None:
+                rows = await conn.fetch(
+                    "SELECT * FROM session_gaps WHERE resolved_at IS NULL ORDER BY detected_at"
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM session_gaps "
+                    "WHERE resolved_at IS NULL AND session_id = $1 "
+                    "ORDER BY detected_at",
+                    session_id,
+                )
+        return tuple(_row_to_gap(r) for r in rows)
+
+    async def resolve(
+        self,
+        gap_id: str,
+        *,
+        resolved_at: str,
+        resolved_by_learning: str | None,
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE session_gaps
+                SET resolved_at = $2, resolved_by_learning = $3
+                WHERE gap_id = $1
+                """,
+                gap_id,
+                _to_datetime(resolved_at),
+                resolved_by_learning,
+            )
+
+
 __all__ = [
+    "AsyncpgConflictStore",
     "AsyncpgDigestStore",
+    "AsyncpgGapStore",
     "AsyncpgLearningStore",
     "AsyncpgPurposeStore",
     "AsyncpgWatermarkStore",
