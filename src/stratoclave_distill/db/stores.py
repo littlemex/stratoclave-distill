@@ -24,14 +24,29 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from stratoclave_distill.core.types import (
+    BranchState,
+    ConflictResolution,
     Learning,
+    LearningConflict,
     LearningScope,
     SessionDigest,
+    SessionGap,
     SessionPurpose,
 )
+
+RetrievalLane = Literal["canonical", "emerging", "all"]
+"""Stage B+ retrieval lane.
+
+- ``canonical`` — long-lived, well-attested rules. The retriever filters to
+  ``evidence_count >= canonical_min_evidence`` AND created at least
+  ``canonical_min_age_days`` ago AND ``scope != 'experiment'``.
+- ``emerging`` — everything else still active.
+- ``all`` — preserves the Stage B behaviour for callers that have not opted
+  into lane filtering yet.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,11 +91,30 @@ class PurposeStore(Protocol):
     ``upsert`` is idempotent: re-distilling a session must not create a
     second row, and must update ``last_updated_at`` (the caller is
     expected to set the timestamp on the dataclass).
+
+    Stage B+ adds branching helpers (:meth:`set_branch_state`,
+    :meth:`list_branches`) so the CLI can manage the open/closed/promoted
+    lifecycle without round-tripping through ``upsert``.
     """
 
     async def upsert(self, purpose: SessionPurpose) -> None: ...
 
     async def get(self, session_id: str) -> SessionPurpose | None: ...
+
+    async def set_branch_state(
+        self,
+        session_id: str,
+        *,
+        branch_state: BranchState,
+        closed_at: str | None,
+        last_updated_at: str,
+    ) -> None: ...
+
+    async def list_branches(
+        self,
+        *,
+        parent_session_id: str | None = None,
+    ) -> Sequence[SessionPurpose]: ...
 
 
 @runtime_checkable
@@ -140,13 +174,73 @@ class LearningStore(Protocol):
         top_k: int = 10,
         rrf_k: int = 60,
         scope: LearningScope | None = None,
+        lane: RetrievalLane = "all",
+        canonical_min_evidence: int = 3,
+        canonical_min_age_days: int = 14,
     ) -> Sequence[LearningSearchHit]: ...
 
 
+@runtime_checkable
+class ConflictStore(Protocol):
+    """Stores rows of :class:`LearningConflict`.
+
+    The Curator writes here whenever the ``CONFLICT_NOTED`` action fires
+    (or when ``SUPERSEDE`` runs and we want to record *why* a row was
+    archived). The retriever reads via :meth:`list_open` / :meth:`list_for`
+    so it can flag contested rules cheaply.
+    """
+
+    async def insert(self, conflict: LearningConflict) -> None: ...
+
+    async def get(self, conflict_id: str) -> LearningConflict | None: ...
+
+    async def list_open(self) -> Sequence[LearningConflict]: ...
+
+    async def list_for(self, learning_id: str) -> Sequence[LearningConflict]: ...
+
+    async def resolve(
+        self,
+        conflict_id: str,
+        *,
+        resolution: ConflictResolution,
+    ) -> None: ...
+
+
+@runtime_checkable
+class GapStore(Protocol):
+    """Stores rows of :class:`SessionGap`.
+
+    Gaps are unresolved questions a session noted but did not answer.
+    The pipeline writes them via :meth:`insert`; the retriever reads via
+    :meth:`list_unresolved` so prompts can reference open questions.
+    """
+
+    async def insert(self, gap: SessionGap) -> None: ...
+
+    async def get(self, gap_id: str) -> SessionGap | None: ...
+
+    async def list_unresolved(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> Sequence[SessionGap]: ...
+
+    async def resolve(
+        self,
+        gap_id: str,
+        *,
+        resolved_at: str,
+        resolved_by_learning: str | None,
+    ) -> None: ...
+
+
 __all__ = [
+    "ConflictStore",
     "DigestStore",
+    "GapStore",
     "LearningSearchHit",
     "LearningStore",
     "PurposeStore",
+    "RetrievalLane",
     "WatermarkStore",
 ]

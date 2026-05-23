@@ -36,6 +36,7 @@ from stratoclave_distill.db.memory import (
     InMemoryWatermarkStore,
 )
 from stratoclave_distill.pipeline import (
+    BranchPlan,
     Curator,
     Distiller,
     IngestReport,
@@ -411,3 +412,110 @@ async def test_session_ingest_result_is_a_frozen_dataclass() -> None:
     )
     with pytest.raises(AttributeError):
         result.session_id = "s-2"  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------
+# Stage B+ — BranchPlan
+# --------------------------------------------------------------------------
+
+
+def test_branch_plan_validates_session_ids() -> None:
+    with pytest.raises(ValueError, match=r"session_id must be a non-empty"):
+        BranchPlan(session_id="", parent_session_id="parent", at_seq=1)
+    with pytest.raises(ValueError, match=r"parent_session_id must be a non-empty"):
+        BranchPlan(session_id="child", parent_session_id="", at_seq=1)
+    with pytest.raises(ValueError, match=r"must differ"):
+        BranchPlan(session_id="same", parent_session_id="same", at_seq=1)
+    with pytest.raises(ValueError, match=r"at_seq must be >= 0"):
+        BranchPlan(session_id="child", parent_session_id="parent", at_seq=-1)
+
+
+@pytest.mark.asyncio
+async def test_branch_plan_skips_pre_branch_turns_and_stamps_purpose() -> None:
+    """Turns with seq <= at_seq are ignored; the new purpose carries branch metadata."""
+
+    runner, watermarks, purposes, _digests, _learnings, _llm = _make_runner()
+    turns = [
+        _turn(seq=4, session_id="s-child", text="parent turn replayed"),
+        _turn(seq=5, session_id="s-child", text="parent turn at boundary"),
+        _turn(seq=6, session_id="s-child", text="branch turn"),
+        _turn(seq=7, session_id="s-child", text="branch turn 2"),
+    ]
+    plan = BranchPlan(
+        session_id="s-child",
+        parent_session_id="s-parent",
+        at_seq=5,
+        branch_kind="experiment",
+    )
+    report = await runner.run_turns(turns, branch_plan=plan)
+
+    [session] = report.sessions
+    assert session.session_id == "s-child"
+    assert session.distilled is True
+    assert session.prior_seq == 5  # bumped from 0 by the plan
+    assert session.new_seq == 7
+
+    # Watermark advanced
+    assert await watermarks.get("s-child") == 7
+
+    # Purpose carries the branch topology
+    purpose = await purposes.get("s-child")
+    assert purpose is not None
+    assert purpose.parent_session_id == "s-parent"
+    assert purpose.branched_at_seq == 5
+    assert purpose.branch_kind == "experiment"
+    assert purpose.branch_state == "open"
+    assert purpose.closed_at is None
+
+
+@pytest.mark.asyncio
+async def test_branch_plan_only_applied_on_first_ingest() -> None:
+    """Re-ingesting the same session preserves the existing topology."""
+
+    runner, _w, purposes, _d, _l, _llm = _make_runner(
+        llm_responses=[_ok_payload(), _ok_payload(purpose="updated")],
+    )
+    plan = BranchPlan(
+        session_id="s-child",
+        parent_session_id="s-parent",
+        at_seq=5,
+    )
+    await runner.run_turns([_turn(seq=6, session_id="s-child")], branch_plan=plan)
+
+    # Second ingest: caller might pass a *different* plan (or none) — topology stays.
+    plan2 = BranchPlan(
+        session_id="s-child",
+        parent_session_id="s-other-parent",
+        at_seq=10,
+        branch_kind="main",
+    )
+    await runner.run_turns([_turn(seq=11, session_id="s-child")], branch_plan=plan2)
+
+    purpose = await purposes.get("s-child")
+    assert purpose is not None
+    assert purpose.parent_session_id == "s-parent"  # unchanged
+    assert purpose.branched_at_seq == 5
+    assert purpose.branch_kind == "experiment"
+
+
+@pytest.mark.asyncio
+async def test_branch_plan_only_targets_named_session_id() -> None:
+    """A plan addressed to s-child does not bleed into s-other in the same batch."""
+
+    runner, _w, purposes, _d, _l, _llm = _make_runner(llm_responses=[_ok_payload(), _ok_payload()])
+    plan = BranchPlan(
+        session_id="s-child",
+        parent_session_id="s-parent",
+        at_seq=0,
+    )
+    turns = [
+        _turn(seq=1, session_id="s-child"),
+        _turn(seq=1, session_id="s-other"),
+    ]
+    await runner.run_turns(turns, branch_plan=plan)
+
+    child = await purposes.get("s-child")
+    other = await purposes.get("s-other")
+    assert child is not None and child.parent_session_id == "s-parent"
+    assert other is not None and other.parent_session_id is None
+    assert other.branch_kind == "main"

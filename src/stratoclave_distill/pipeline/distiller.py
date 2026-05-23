@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 
 from stratoclave_distill.core.errors import LLMError
 from stratoclave_distill.core.types import (
+    ClaimType,
     Learning,
     NormalizedTurn,
     SessionDigest,
@@ -39,7 +40,9 @@ from stratoclave_distill.core.types import (
 from stratoclave_distill.providers.embedding import EmbeddingProvider
 from stratoclave_distill.providers.llm import LLMMessage, LLMProvider
 
-_VALID_SCOPES: frozenset[str] = frozenset({"session", "project", "group", "shared"})
+_VALID_SCOPES: frozenset[str] = frozenset({"session", "project", "group", "shared", "experiment"})
+_VALID_CLAIM_TYPES: frozenset[str] = frozenset({"observation", "interpretation", "signal", "norm"})
+_DEFAULT_CLAIM_TYPE: ClaimType = "signal"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,9 +86,14 @@ _SYSTEM_PROMPT = (
     '"success_score": float|null, "polluted": bool, "pollution_reason": str|null}, '
     '"digest": {"summary_md": str, "bm25_text": str}, '
     '"learnings": ['
-    '{"scope": "session"|"project"|"group"|"shared", '
+    '{"scope": "session"|"project"|"group"|"shared"|"experiment", '
     '"rule": str, "why": str, "triggers": object, '
+    '"claim_type": "observation"|"interpretation"|"signal"|"norm", '
     '"evidence_count": int, "confidence": float, "bm25_text": str}, ...]}\n'
+    "claim_type vocabulary: 'observation' is a directly witnessed fact; "
+    "'interpretation' is a model of why something happened; 'signal' is a heuristic "
+    "worth noticing but not yet a stable rule; 'norm' is a recommended practice. "
+    "Use 'experiment' scope only when this session is on an explicit experiment branch. "
     "Be terse. Prefer at most a handful of high-signal learnings; emit an empty array "
     "if nothing reusable was demonstrated. Never invent facts; if uncertain, set "
     '"polluted": true and explain in "pollution_reason".'
@@ -241,6 +249,19 @@ def _parse_learning(
     confidence_raw = obj.get("confidence", 0.5)
     if isinstance(confidence_raw, bool) or not isinstance(confidence_raw, (int, float)):
         raise LLMError("distill JSON: learning 'confidence' must be a number")
+    claim_type_raw = obj.get("claim_type")
+    claim_type: ClaimType
+    if claim_type_raw is None:
+        claim_type = _DEFAULT_CLAIM_TYPE
+    elif not isinstance(claim_type_raw, str):
+        raise LLMError("distill JSON: learning 'claim_type' must be a string or null")
+    elif claim_type_raw not in _VALID_CLAIM_TYPES:
+        raise LLMError(
+            f"distill JSON: learning 'claim_type' must be one of "
+            f"{sorted(_VALID_CLAIM_TYPES)!r}, got {claim_type_raw!r}"
+        )
+    else:
+        claim_type = claim_type_raw  # type: ignore[assignment]
     return Learning(
         learning_id=str(uuid.uuid4()),
         scope=scope_raw,  # type: ignore[arg-type]
@@ -254,6 +275,7 @@ def _parse_learning(
         bm25_text=_require_str(obj, "bm25_text", allow_empty=True),
         created_at=now,
         updated_at=now,
+        claim_type=claim_type,
     )
 
 

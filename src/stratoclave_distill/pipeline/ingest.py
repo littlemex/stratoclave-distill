@@ -27,10 +27,10 @@ unit tests use the in-memory variant and the CLI wires in asyncpg.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from stratoclave_distill.core.errors import DistillError
-from stratoclave_distill.core.types import NormalizedTurn
+from stratoclave_distill.core.types import BranchKind, NormalizedTurn
 from stratoclave_distill.db.stores import (
     DigestStore,
     PurposeStore,
@@ -39,6 +39,40 @@ from stratoclave_distill.db.stores import (
 from stratoclave_distill.pipeline.curator import CurationOutcome, Curator
 from stratoclave_distill.pipeline.distiller import Distiller
 from stratoclave_distill.pipeline.reader import JsonlSessionReader, SkippedLine
+
+
+@dataclass(frozen=True, slots=True)
+class BranchPlan:
+    """Stage B+ branch hint applied during the *first* ingest of a session.
+
+    When a caller (typically the CLI's ``ingest --branch-from``) wants the
+    runner to record that ``session_id`` is a branch off ``parent_session_id``
+    starting at ``at_seq``, they construct a :class:`BranchPlan` and pass
+    it to :meth:`IngestRunner.run_path`.
+
+    The plan is applied only when the session is *new* (no purpose row in
+    the store yet). Re-running ``ingest`` against the same session id is
+    idempotent: the existing branching topology is preserved.
+
+    Turns with ``seq <= at_seq`` are skipped, so the experiment file can
+    legitimately replay the parent's earlier turns without re-distilling
+    them.
+    """
+
+    session_id: str
+    parent_session_id: str
+    at_seq: int
+    branch_kind: BranchKind = "experiment"
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            raise ValueError("BranchPlan.session_id must be a non-empty string")
+        if not self.parent_session_id:
+            raise ValueError("BranchPlan.parent_session_id must be a non-empty string")
+        if self.parent_session_id == self.session_id:
+            raise ValueError("BranchPlan.parent_session_id must differ from session_id")
+        if self.at_seq < 0:
+            raise ValueError(f"BranchPlan.at_seq must be >= 0, got {self.at_seq}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,32 +169,46 @@ class IngestRunner:
         self._digests = digests
         self._strict = strict
 
-    async def run_path(self, path: str) -> IngestReport:
+    async def run_path(
+        self,
+        path: str,
+        *,
+        branch_plan: BranchPlan | None = None,
+    ) -> IngestReport:
         """Read a JSONL file and ingest every session it contains."""
 
         reader = JsonlSessionReader(path, strict=self._strict)
         turns = list(reader.read())
-        return await self.run_turns(turns, skipped_lines=reader.skipped)
+        return await self.run_turns(turns, skipped_lines=reader.skipped, branch_plan=branch_plan)
 
     async def run_turns(
         self,
         turns: Sequence[NormalizedTurn],
         *,
         skipped_lines: Sequence[SkippedLine] = (),
+        branch_plan: BranchPlan | None = None,
     ) -> IngestReport:
         """Ingest a pre-decoded sequence of turns. Useful in tests."""
 
         groups = _group_by_session(turns)
         results: list[SessionIngestResult] = []
         for session_id, session_turns in groups.items():
-            result = await self._run_session(session_id, session_turns)
+            plan = branch_plan if branch_plan and branch_plan.session_id == session_id else None
+            result = await self._run_session(session_id, session_turns, branch_plan=plan)
             results.append(result)
         return IngestReport(sessions=tuple(results), skipped_lines=tuple(skipped_lines))
 
     async def _run_session(
-        self, session_id: str, turns: Sequence[NormalizedTurn]
+        self,
+        session_id: str,
+        turns: Sequence[NormalizedTurn],
+        *,
+        branch_plan: BranchPlan | None = None,
     ) -> SessionIngestResult:
         prior_seq = await self._watermarks.get(session_id)
+        # A branch plan implicitly skips parent-shared turns.
+        if branch_plan is not None:
+            prior_seq = max(prior_seq, branch_plan.at_seq)
         fresh = [t for t in turns if t.seq > prior_seq]
         if not fresh:
             return SessionIngestResult(
@@ -177,7 +225,28 @@ class IngestRunner:
             result = await self._distiller.distill(
                 fresh, session_id=session_id, prior_purpose=prior_purpose
             )
-            await self._purposes.upsert(result.purpose)
+            purpose = result.purpose
+            if prior_purpose is not None:
+                # Distiller does not know about branching; preserve the
+                # topology that was set when the session was first ingested.
+                purpose = replace(
+                    purpose,
+                    parent_session_id=prior_purpose.parent_session_id,
+                    branched_at_seq=prior_purpose.branched_at_seq,
+                    branch_kind=prior_purpose.branch_kind,
+                    branch_state=prior_purpose.branch_state,
+                    closed_at=prior_purpose.closed_at,
+                )
+            elif branch_plan is not None:
+                purpose = replace(
+                    purpose,
+                    parent_session_id=branch_plan.parent_session_id,
+                    branched_at_seq=branch_plan.at_seq,
+                    branch_kind=branch_plan.branch_kind,
+                    branch_state="open",
+                    closed_at=None,
+                )
+            await self._purposes.upsert(purpose)
             await self._digests.upsert(result.digest, embedding=list(result.digest_embedding))
             outcome = await self._curator.curate(result.candidate_learnings)
             await self._watermarks.advance(
@@ -207,6 +276,7 @@ class IngestRunner:
 
 
 __all__ = [
+    "BranchPlan",
     "IngestReport",
     "IngestRunner",
     "SessionIngestResult",

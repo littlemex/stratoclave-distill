@@ -172,3 +172,121 @@ def test_ingest_dry_run_strict_aborts_on_bad_line(
     rc = main(["ingest", str(path), "--dry-run", "--strict"])
     assert rc == 2
     assert "error:" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Stage B+ ingest --branch-from
+# --------------------------------------------------------------------------
+
+
+def test_ingest_branch_flags_require_full_set(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    path = tmp_path / "session.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "turn_id": "t-1",
+                "session_id": "s-child",
+                "seq": 6,
+                "role": "user",
+                "text_content": "hi",
+                "occurred_at": "2026-05-22T00:00:00Z",
+            }
+        ],
+    )
+
+    rc = main(
+        [
+            "ingest",
+            str(path),
+            "--dry-run",
+            "--branch-from",
+            "s-parent",
+        ]
+    )
+    assert rc == 2
+    assert "must be supplied together" in capsys.readouterr().err
+
+
+def test_ingest_branch_dry_run_passes_through(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    path = tmp_path / "session.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "turn_id": "t-1",
+                "session_id": "s-child",
+                "seq": 6,
+                "role": "user",
+                "text_content": "hi",
+                "occurred_at": "2026-05-22T00:00:00Z",
+            },
+            {
+                "turn_id": "t-2",
+                "session_id": "s-child",
+                "seq": 7,
+                "role": "assistant",
+                "text_content": "ok",
+                "occurred_at": "2026-05-22T00:00:01Z",
+            },
+        ],
+    )
+
+    rc = main(
+        [
+            "ingest",
+            str(path),
+            "--dry-run",
+            "--branch-from",
+            "s-parent",
+            "--branch-session",
+            "s-child",
+            "--at-seq",
+            "5",
+            "--branch-kind",
+            "experiment",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["distilled_count"] == 1
+    [session] = payload["sessions"]
+    assert session["session_id"] == "s-child"
+    assert session["prior_seq"] == 5  # bumped by the branch plan
+    assert session["new_seq"] == 7
+
+
+def test_branch_list_requires_database_url(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    rc = main(["branch", "list"])
+    assert rc == 2
+    assert "DATABASE_URL is required" in capsys.readouterr().err
+
+
+def test_branch_close_requires_database_url(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    rc = main(["branch", "close", "s-child"])
+    assert rc == 2
+    assert "DATABASE_URL is required" in capsys.readouterr().err
+
+
+def test_branch_list_rejects_both_tree_and_json(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://distill:distill@localhost:5432/distill"
+    )
+    monkeypatch.setenv("DISTILL_LLM_PROVIDER", "stub")
+    monkeypatch.setenv("DISTILL_EMBEDDING_PROVIDER", "stub")
+    monkeypatch.setenv("DISTILL_EMBEDDING_DIM", "8")
+    rc = main(["branch", "list", "--tree", "--json"])
+    assert rc == 2
+    assert "mutually exclusive" in capsys.readouterr().err

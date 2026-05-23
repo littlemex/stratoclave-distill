@@ -1,6 +1,6 @@
 # stratoclave-distill: Getting Started Guide
 
-**Last updated**: 2026-05-22
+**Last updated**: 2026-05-23
 **Audience**: First-time contributors and operators
 
 ## Introduction
@@ -104,13 +104,17 @@ DATABASE_URL=postgresql+psycopg://distill:distill@localhost:5432/distill \
   alembic upgrade head
 ```
 
-You should see five new tables (`session_purposes`, `session_digests`,
-`learnings`, `distill_watermarks`, `group_learnings`).
+You should see seven tables (`session_purposes`, `session_digests`,
+`learnings`, `distill_watermarks`, `group_learnings`,
+`learning_conflicts`, `session_gaps`). Migration `0002` also adds
+branching columns to `session_purposes` and a `claim_type` column
+to `learnings`.
 
 ## Quick start (Python API)
 
-The Distiller / Retriever land in Stage B and C. For Stage A you can
-already exercise the providers and configuration loader directly:
+Stage A wires the providers / config and Stage B+ ships the full
+ingest pipeline (Distiller, Curator, IngestRunner, Retriever, branch
+CLI). The simplest smoke test still works against the stub providers:
 
 ```python
 import asyncio
@@ -140,7 +144,11 @@ asyncio.run(main())
 | `stratoclave_distill.core.errors`       | Error hierarchy                     |
 | `stratoclave_distill.providers`         | LLM and embedding adapters          |
 | `stratoclave_distill.cli`               | `stratoclave-distill` entrypoint    |
+| `stratoclave_distill.pipeline`          | Reader / Distiller / Curator / IngestRunner |
+| `stratoclave_distill.retrieval`         | Retriever (canonical / emerging lanes) |
+| `stratoclave_distill.db`                | Store Protocols + in-memory + asyncpg |
 | `migrations/versions/0001_initial_schema.py` | First Postgres migration       |
+| `migrations/versions/0002_branching_and_relations.py` | Stage B+ branching + side relations |
 
 ## Running the tests
 
@@ -169,6 +177,43 @@ release branches.
 ```bash
 pytest -m e2e
 ```
+
+
+## Branching workflow (Stage B+)
+
+Stage B+ adds first-class branching: a session can fork off another
+session at a specific turn (`--at-seq`), live in its own
+`experiment` state, and either be promoted back into `main` or
+closed without polluting the canonical history.
+
+Open a branch while ingesting:
+
+```bash
+stratoclave-distill ingest path/to/turns.jsonl \
+  --branch-from parent-session-id \
+  --branch-session new-experiment-session-id \
+  --at-seq 42 \
+  --branch-kind experiment
+```
+
+The three flags `--branch-from`, `--branch-session` and `--at-seq`
+are all-or-nothing; supplying any one without the others is an error.
+
+Close a branch when the experiment is over:
+
+```bash
+stratoclave-distill branch close new-experiment-session-id
+```
+
+List the branch topology as a tree (default) or as JSON:
+
+```bash
+stratoclave-distill branch list --tree
+stratoclave-distill branch list --json | jq .
+```
+
+See `docs/STAGE_B_PLUS_DESIGN.md` for the full design (data model,
+claim_type taxonomy, conflict / gap relations, retrieval lanes).
 
 ## Troubleshooting
 

@@ -10,19 +10,29 @@ from stratoclave_distill.core.errors import (
     SchemaError,
 )
 from stratoclave_distill.core.types import (
+    BranchKind,
+    BranchState,
+    ClaimType,
+    ConflictResolution,
     ContextPack,
     ContextPackItem,
     EmbeddingRecord,
     GroupLearning,
     Learning,
+    LearningConflict,
     LearningScope,
     NormalizedTurn,
     SessionDigest,
+    SessionGap,
     SessionPurpose,
 )
 
 __all__ = [
+    "BranchKind",
+    "BranchState",
+    "ClaimType",
     "ConfigError",
+    "ConflictResolution",
     "ContextPack",
     "ContextPackItem",
     "DistillError",
@@ -32,10 +42,12 @@ __all__ = [
     "IngestError",
     "LLMError",
     "Learning",
+    "LearningConflict",
     "LearningScope",
     "NormalizedTurn",
     "NotFoundError",
     "SchemaError",
     "SessionDigest",
+    "SessionGap",
     "SessionPurpose",
 ]

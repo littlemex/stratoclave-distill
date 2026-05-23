@@ -16,11 +16,45 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
-LearningScope = Literal["session", "project", "group", "shared"]
-"""Where a learning applies. Aligned with DESIGN section 6.4."""
+LearningScope = Literal["session", "project", "group", "shared", "experiment"]
+"""Where a learning applies. Aligned with DESIGN section 6.4.
+
+Stage B+ widens the vocabulary with ``experiment`` so an experiment branch can
+record learnings that are deliberately quarantined from the canonical lane
+until the branch is promoted.
+"""
 
 DigestKind = Literal["digest", "learning", "group_learning"]
 """Which table a ContextPack item came from. Drives Markdown formatting."""
+
+BranchKind = Literal["main", "experiment"]
+"""Whether a session is on the canonical timeline or an experimental branch.
+
+Stage B+ topology lets an ``experiment`` branch sit alongside ``main`` without
+duplicating the parent's learnings; promotion merges the experiment back in.
+"""
+
+BranchState = Literal["open", "closed", "promoted"]
+"""Lifecycle state for a branched session.
+
+- ``open``: actively accepting new turns / learnings.
+- ``closed``: no further work, retained for history.
+- ``promoted``: an ``experiment`` branch whose learnings have been merged
+  into the canonical lane. Downgrade of migration 0002 refuses to run while
+  any session is in this state, so operators do not silently lose semantics.
+"""
+
+ClaimType = Literal["observation", "interpretation", "signal", "norm"]
+"""Epistemic kind of a learning.
+
+- ``observation``: directly witnessed fact (e.g. \"the API returned 503\").
+- ``interpretation``: a model of *why* something happened.
+- ``signal``: a heuristic worth noticing, not yet a stable rule.
+- ``norm``: a recommended practice. The retriever's canonical lane prefers
+  ``norm`` and ``observation`` over ``signal`` and ``interpretation``.
+
+When omitted, callers default to ``signal`` semantics (see Distiller).
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +80,12 @@ class NormalizedTurn:
 
 @dataclass(frozen=True, slots=True)
 class SessionPurpose:
-    """The role and health of a single session."""
+    """The role and health of a single session.
+
+    Stage B+ adds the branching topology fields. Existing rows pick up
+    ``branch_kind = 'main'`` and ``branch_state = 'open'`` from the migration
+    defaults, so callers that ignore branching see the same behavior as before.
+    """
 
     session_id: str
     purpose: str
@@ -57,6 +96,11 @@ class SessionPurpose:
     derived_from_version: str = ""
     derived_at: str = ""
     last_updated_at: str = ""
+    parent_session_id: str | None = None
+    branched_at_seq: int | None = None
+    branch_kind: BranchKind = "main"
+    branch_state: BranchState = "open"
+    closed_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +139,54 @@ class Learning:
     bm25_text: str = ""
     created_at: str = ""
     updated_at: str = ""
+    claim_type: ClaimType | None = None
+
+
+ConflictResolution = Literal["open", "merged", "superseded", "coexist"]
+"""How a logged contradiction between two learnings was eventually resolved.
+
+- ``open``: the conflict is unresolved and the retriever should flag both
+  sides as contested.
+- ``merged``: the curator combined them into one learning.
+- ``superseded``: one explicitly replaced the other (the loser is archived).
+- ``coexist``: both are intentionally kept (they are scoped differently
+  enough that they do not actually contradict).
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class LearningConflict:
+    """A logged contradiction between two learnings.
+
+    Stage B+ surfaces conflicts as first-class rows so the retriever can flag
+    contested rules cheaply (via the partial index on ``resolution = 'open'``).
+    """
+
+    conflict_id: str
+    from_id: str
+    to_id: str
+    reason: str
+    cosine_at_detection: float
+    detected_at: str = ""
+    resolution: ConflictResolution = "open"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionGap:
+    """An unresolved question a session noted but did not answer.
+
+    These are searchable via BM25 (``bm25_text``) and are linked back to the
+    learning that eventually resolved them via ``resolved_by_learning``.
+    """
+
+    gap_id: str
+    session_id: str
+    topic: str
+    why_unknown: str
+    bm25_text: str = ""
+    detected_at: str = ""
+    resolved_at: str | None = None
+    resolved_by_learning: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -20,12 +20,15 @@ hybrid-search code path; we never mock the store.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from stratoclave_distill.core.types import Learning
-from stratoclave_distill.db.memory import InMemoryLearningStore
+from stratoclave_distill.db.memory import InMemoryConflictStore, InMemoryLearningStore
 from stratoclave_distill.pipeline import (
     CandidateLearning,
+    ConflictVerdict,
     Curator,
 )
 
@@ -202,8 +205,6 @@ async def test_curate_supersedes_when_in_conflict_band() -> None:
     curator = Curator(
         store, tau_merge=0.95, tau_conflict=0.80, clock=lambda: "2026-05-22T02:00:00Z"
     )
-    import math
-
     angle = math.sqrt(1 - 0.9 * 0.9)
     cand = _candidate(
         "cand-1",
@@ -304,3 +305,208 @@ async def test_curate_empty_batch_returns_no_decisions() -> None:
     curator = Curator(store, clock=lambda: "t")
     outcome = await curator.curate([])
     assert outcome.decisions == ()
+
+
+# --------------------------------------------------------------------------
+# Stage B+ — ConflictJudge / CONFLICT_NOTED action
+# --------------------------------------------------------------------------
+
+
+class _StubJudge:
+    """Records adjudicate calls and returns a configurable verdict."""
+
+    def __init__(self, verdict: ConflictVerdict) -> None:
+        self.verdict = verdict
+        self.calls: list[tuple[str, str, float]] = []
+
+    async def adjudicate(
+        self,
+        *,
+        candidate: Learning,
+        existing: Learning,
+        cosine: float,
+    ) -> ConflictVerdict:
+        self.calls.append((candidate.learning_id, existing.learning_id, cosine))
+        return self.verdict
+
+
+def _conflict_band_candidate(learning_id: str = "cand-1") -> CandidateLearning:
+    """Embedding designed to land cosine ~0.9 against an existing (1,0) row."""
+
+    angle = math.sqrt(1 - 0.9 * 0.9)
+    return _candidate(
+        learning_id,
+        embedding=(0.9, angle),
+        rule="refined rule",
+        bm25_text="refined rule",
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_judge_preserves_legacy_supersede_behavior() -> None:
+    """Without an injected judge, borderline-cosine candidates still SUPERSEDE."""
+
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("exist-1", rule="old rule", bm25_text="old rule"),
+        embedding=[1.0, 0.0],
+    )
+
+    curator = Curator(
+        store, tau_merge=0.95, tau_conflict=0.80, clock=lambda: "2026-05-22T02:00:00Z"
+    )
+    [decision] = (await curator.curate([_conflict_band_candidate()])).decisions
+    assert decision.action == "SUPERSEDE"
+
+
+@pytest.mark.asyncio
+async def test_judge_conflict_verdict_writes_conflict_row() -> None:
+    """verdict='conflict' inserts the candidate AND writes a learning_conflicts row."""
+
+    store = InMemoryLearningStore()
+    conflicts = InMemoryConflictStore()
+    await store.insert(
+        _learning("exist-1", rule="old rule", bm25_text="old rule"),
+        embedding=[1.0, 0.0],
+    )
+
+    judge = _StubJudge("conflict")
+    curator = Curator(
+        store,
+        tau_merge=0.95,
+        tau_conflict=0.80,
+        judge=judge,
+        conflict_store=conflicts,
+        clock=lambda: "2026-05-22T02:00:00Z",
+    )
+
+    [decision] = (await curator.curate([_conflict_band_candidate()])).decisions
+    assert decision.action == "CONFLICT_NOTED"
+    assert decision.existing_id == "exist-1"
+    assert judge.calls and judge.calls[0][0:2] == ("cand-1", "exist-1")
+
+    # Both rows remain active
+    new = await store.get("cand-1")
+    old = await store.get("exist-1")
+    assert new is not None and new.archived_at is None
+    assert old is not None and old.archived_at is None
+
+    open_conflicts = await conflicts.list_open()
+    assert len(open_conflicts) == 1
+    row = open_conflicts[0]
+    assert row.from_id == "exist-1"
+    assert row.to_id == "cand-1"
+    assert row.resolution == "open"
+    assert row.detected_at == "2026-05-22T02:00:00Z"
+    assert 0.80 <= row.cosine_at_detection < 0.95
+
+
+@pytest.mark.asyncio
+async def test_judge_merge_verdict_overrides_into_merge() -> None:
+    """verdict='merge' folds the candidate into the existing row even below tau_merge."""
+
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("exist-1", rule="old rule", bm25_text="old rule", evidence_count=1),
+        embedding=[1.0, 0.0],
+    )
+    judge = _StubJudge("merge")
+    curator = Curator(
+        store,
+        tau_merge=0.95,
+        tau_conflict=0.80,
+        judge=judge,
+        clock=lambda: "2026-05-22T02:00:00Z",
+    )
+
+    [decision] = (await curator.curate([_conflict_band_candidate()])).decisions
+    assert decision.action == "MERGE"
+    assert decision.existing_id == "exist-1"
+    assert await store.get("cand-1") is None  # candidate id discarded
+    merged = await store.get("exist-1")
+    assert merged is not None
+    assert merged.evidence_count == 2
+
+
+@pytest.mark.asyncio
+async def test_judge_supersede_verdict_matches_default() -> None:
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("exist-1", rule="old rule", bm25_text="old rule"),
+        embedding=[1.0, 0.0],
+    )
+    judge = _StubJudge("supersede")
+    curator = Curator(
+        store,
+        tau_merge=0.95,
+        tau_conflict=0.80,
+        judge=judge,
+        clock=lambda: "2026-05-22T02:00:00Z",
+    )
+
+    [decision] = (await curator.curate([_conflict_band_candidate()])).decisions
+    assert decision.action == "SUPERSEDE"
+    archived = await store.get("exist-1")
+    assert archived is not None
+    assert archived.superseded_by == "cand-1"
+
+
+@pytest.mark.asyncio
+async def test_judge_not_consulted_above_tau_merge() -> None:
+    """Cosine >= tau_merge is an unambiguous MERGE — no judge call."""
+
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("exist-1", rule="rule", bm25_text="rule"),
+        embedding=[1.0, 0.0],
+    )
+    judge = _StubJudge("conflict")
+    curator = Curator(store, judge=judge, clock=lambda: "t")
+    cand = _candidate("cand-1", embedding=(1.0, 0.0), rule="rule", bm25_text="rule")
+
+    [decision] = (await curator.curate([cand])).decisions
+    assert decision.action == "MERGE"
+    assert judge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_judge_not_consulted_below_tau_conflict() -> None:
+    """Cosine < tau_conflict is an unambiguous INSERT — no judge call."""
+
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("exist-1", rule="rule", bm25_text="rule"),
+        embedding=[1.0, 0.0],
+    )
+    judge = _StubJudge("conflict")
+    curator = Curator(store, tau_merge=0.95, tau_conflict=0.80, judge=judge, clock=lambda: "t")
+    # Cosine 0 -> below tau_conflict
+    cand = _candidate("cand-1", embedding=(0.0, 1.0), rule="other", bm25_text="other")
+
+    [decision] = (await curator.curate([cand])).decisions
+    assert decision.action == "INSERT"
+    assert judge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_conflict_store_is_optional() -> None:
+    """A 'conflict' verdict without a conflict_store still inserts the candidate."""
+
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("exist-1", rule="old rule", bm25_text="old rule"),
+        embedding=[1.0, 0.0],
+    )
+    judge = _StubJudge("conflict")
+    curator = Curator(
+        store,
+        tau_merge=0.95,
+        tau_conflict=0.80,
+        judge=judge,
+        clock=lambda: "t",
+    )
+
+    [decision] = (await curator.curate([_conflict_band_candidate()])).decisions
+    assert decision.action == "CONFLICT_NOTED"
+    assert await store.get("cand-1") is not None
+    assert await store.get("exist-1") is not None  # not archived

@@ -32,11 +32,15 @@ import pytest
 
 from stratoclave_distill.core.types import (
     Learning,
+    LearningConflict,
     SessionDigest,
+    SessionGap,
     SessionPurpose,
 )
 from stratoclave_distill.db.asyncpg import (
+    AsyncpgConflictStore,
     AsyncpgDigestStore,
+    AsyncpgGapStore,
     AsyncpgLearningStore,
     AsyncpgPurposeStore,
     AsyncpgWatermarkStore,
@@ -93,7 +97,8 @@ async def truncated_pool(db_url: str) -> AsyncIterator[object]:
         async with pool.acquire() as conn:
             await conn.execute(
                 "TRUNCATE learnings, session_digests, session_purposes, "
-                "distill_watermarks, group_learnings RESTART IDENTITY CASCADE"
+                "distill_watermarks, group_learnings, learning_conflicts, "
+                "session_gaps RESTART IDENTITY CASCADE"
             )
         yield pool
 
@@ -331,3 +336,244 @@ async def test_learning_search_hybrid_filters_by_scope(truncated_pool: object) -
         scope="project",
     )
     assert [h.learning.learning_id for h in project_only] == [p.learning_id]
+
+
+# --------------------------------------------------------------------------
+# Stage B+ — branching, claim_type, lanes, conflict / gap stores
+# --------------------------------------------------------------------------
+
+
+async def test_purpose_branching_round_trip(truncated_pool: object) -> None:
+    store = AsyncpgPurposeStore(truncated_pool)
+    parent_id = _new_id()
+    child_id = _new_id()
+
+    parent = SessionPurpose(
+        session_id=parent_id,
+        purpose="parent goal",
+        derived_from_version="v",
+        derived_at="2026-05-22T00:00:00Z",
+        last_updated_at="2026-05-22T00:00:00Z",
+    )
+    child = SessionPurpose(
+        session_id=child_id,
+        purpose="experiment goal",
+        derived_from_version="v",
+        derived_at="2026-05-22T01:00:00Z",
+        last_updated_at="2026-05-22T01:00:00Z",
+        parent_session_id=parent_id,
+        branched_at_seq=5,
+        branch_kind="experiment",
+        branch_state="open",
+    )
+    await store.upsert(parent)
+    await store.upsert(child)
+
+    fetched = await store.get(child_id)
+    assert fetched is not None
+    assert fetched.parent_session_id == parent_id
+    assert fetched.branched_at_seq == 5
+    assert fetched.branch_kind == "experiment"
+    assert fetched.branch_state == "open"
+
+    await store.set_branch_state(
+        child_id,
+        branch_state="closed",
+        closed_at="2026-05-22T02:00:00Z",
+        last_updated_at="2026-05-22T02:00:00Z",
+    )
+    closed = await store.get(child_id)
+    assert closed is not None
+    assert closed.branch_state == "closed"
+    assert closed.closed_at == "2026-05-22T02:00:00Z"
+
+    branches = await store.list_branches(parent_session_id=parent_id)
+    assert {b.session_id for b in branches} == {child_id}
+
+
+async def test_learning_claim_type_round_trip(truncated_pool: object) -> None:
+    store = AsyncpgLearningStore(truncated_pool)
+    row = Learning(
+        learning_id=_new_id(),
+        scope="session",
+        rule="experiment finding",
+        why="from a probe",
+        bm25_text="probe finding",
+        evidence_count=1,
+        confidence=0.5,
+        created_at="2026-05-22T00:00:00Z",
+        updated_at="2026-05-22T00:00:00Z",
+        claim_type="signal",
+    )
+    await store.insert(row, embedding=_vec(1.0))
+    fetched = await store.get(row.learning_id)
+    assert fetched is not None
+    assert fetched.claim_type == "signal"
+
+
+async def test_learning_search_hybrid_lane_filtering(truncated_pool: object) -> None:
+    """canonical lane requires evidence + age + scope!='experiment'."""
+
+    store = AsyncpgLearningStore(truncated_pool)
+
+    canonical_row = Learning(
+        learning_id=_new_id(),
+        scope="session",
+        rule="canonical rule",
+        why="why",
+        bm25_text="alpha canonical",
+        evidence_count=5,
+        confidence=0.8,
+        # 30 days old so it passes canonical_min_age_days=14
+        created_at="2026-04-22T00:00:00Z",
+        updated_at="2026-04-22T00:00:00Z",
+    )
+    fresh_row = Learning(
+        learning_id=_new_id(),
+        scope="session",
+        rule="fresh rule",
+        why="why",
+        bm25_text="alpha fresh",
+        evidence_count=5,
+        confidence=0.8,
+        # 1 day old → emerging
+        created_at="2026-05-21T00:00:00Z",
+        updated_at="2026-05-21T00:00:00Z",
+    )
+    experiment_row = Learning(
+        learning_id=_new_id(),
+        scope="experiment",
+        rule="experiment rule",
+        why="why",
+        bm25_text="alpha experiment",
+        evidence_count=5,
+        confidence=0.8,
+        created_at="2026-04-22T00:00:00Z",
+        updated_at="2026-04-22T00:00:00Z",
+    )
+    await store.insert(canonical_row, embedding=_vec(1.0))
+    await store.insert(fresh_row, embedding=_vec(1.0))
+    await store.insert(experiment_row, embedding=_vec(1.0))
+
+    canonical_hits = await store.search_hybrid(
+        query_text="alpha",
+        query_vector=_vec(1.0),
+        top_k=10,
+        lane="canonical",
+        canonical_min_evidence=3,
+        canonical_min_age_days=14,
+    )
+    emerging_hits = await store.search_hybrid(
+        query_text="alpha",
+        query_vector=_vec(1.0),
+        top_k=10,
+        lane="emerging",
+        canonical_min_evidence=3,
+        canonical_min_age_days=14,
+    )
+    canonical_ids = {h.learning.learning_id for h in canonical_hits}
+    emerging_ids = {h.learning.learning_id for h in emerging_hits}
+    assert canonical_ids == {canonical_row.learning_id}
+    assert emerging_ids == {fresh_row.learning_id, experiment_row.learning_id}
+
+
+async def test_conflict_store_lifecycle(truncated_pool: object) -> None:
+    learning_store = AsyncpgLearningStore(truncated_pool)
+    store = AsyncpgConflictStore(truncated_pool)
+    from_id = _new_id()
+    to_id = _new_id()
+    for lid in (from_id, to_id):
+        await learning_store.insert(
+            Learning(
+                learning_id=lid,
+                scope="session",
+                rule=f"rule for {lid[:8]}",
+                why="why",
+                bm25_text="alpha",
+                evidence_count=1,
+                confidence=0.5,
+                created_at="2026-05-21T00:00:00Z",
+                updated_at="2026-05-21T00:00:00Z",
+            ),
+            embedding=_vec(1.0),
+        )
+    cid = _new_id()
+    conflict = LearningConflict(
+        conflict_id=cid,
+        from_id=from_id,
+        to_id=to_id,
+        reason="borderline cosine",
+        cosine_at_detection=0.85,
+        detected_at="2026-05-22T00:00:00Z",
+        resolution="open",
+    )
+    await store.insert(conflict)
+
+    fetched = await store.get(cid)
+    assert fetched is not None
+    assert fetched.reason == "borderline cosine"
+
+    open_rows = await store.list_open()
+    assert any(c.conflict_id == cid for c in open_rows)
+
+    await store.resolve(cid, resolution="superseded")
+    resolved = await store.get(cid)
+    assert resolved is not None
+    assert resolved.resolution == "superseded"
+    open_after = await store.list_open()
+    assert all(c.conflict_id != cid for c in open_after)
+
+
+async def test_gap_store_lifecycle(truncated_pool: object) -> None:
+    purpose_store = AsyncpgPurposeStore(truncated_pool)
+    learning_store = AsyncpgLearningStore(truncated_pool)
+    store = AsyncpgGapStore(truncated_pool)
+    sid = _new_id()
+    await purpose_store.upsert(
+        SessionPurpose(
+            session_id=sid,
+            purpose="alpha",
+            derived_at="2026-05-22T00:00:00Z",
+            last_updated_at="2026-05-22T00:00:00Z",
+        )
+    )
+    gid = _new_id()
+    gap = SessionGap(
+        gap_id=gid,
+        session_id=sid,
+        topic="ef_search optimum",
+        why_unknown="not measured",
+        bm25_text="ef_search optimum tuning",
+        detected_at="2026-05-22T00:00:00Z",
+    )
+    await store.insert(gap)
+
+    fetched = await store.get(gid)
+    assert fetched is not None
+    assert fetched.topic == "ef_search optimum"
+
+    unresolved = await store.list_unresolved(session_id=sid)
+    assert {g.gap_id for g in unresolved} == {gid}
+
+    resolver_id = _new_id()
+    await learning_store.insert(
+        Learning(
+            learning_id=resolver_id,
+            scope="session",
+            rule="resolved by experiment",
+            why="why",
+            bm25_text="resolution",
+            evidence_count=1,
+            confidence=0.5,
+            created_at="2026-05-22T00:00:00Z",
+            updated_at="2026-05-22T00:00:00Z",
+        ),
+        embedding=_vec(1.0),
+    )
+    await store.resolve(gid, resolved_at="2026-05-23T00:00:00Z", resolved_by_learning=resolver_id)
+    resolved = await store.get(gid)
+    assert resolved is not None
+    assert resolved.resolved_at == "2026-05-23T00:00:00Z"
+    assert resolved.resolved_by_learning == resolver_id
+    unresolved_after = await store.list_unresolved(session_id=sid)
+    assert all(g.gap_id != gid for g in unresolved_after)

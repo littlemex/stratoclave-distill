@@ -12,7 +12,11 @@ from stratoclave_distill.config import (
     LLMProviderName,
 )
 from stratoclave_distill.core import (
+    BranchKind,
+    BranchState,
+    ClaimType,
     ConfigError,
+    ConflictResolution,
     ContextPack,
     ContextPackItem,
     DistillError,
@@ -21,17 +25,23 @@ from stratoclave_distill.core import (
     GroupLearning,
     IngestError,
     Learning,
+    LearningConflict,
     LearningScope,
     LLMError,
     NormalizedTurn,
     NotFoundError,
     SchemaError,
     SessionDigest,
+    SessionGap,
     SessionPurpose,
 )
 
 __all__ = [
+    "BranchKind",
+    "BranchState",
+    "ClaimType",
     "ConfigError",
+    "ConflictResolution",
     "ContextPack",
     "ContextPackItem",
     "DistillError",
@@ -44,11 +54,13 @@ __all__ = [
     "LLMError",
     "LLMProviderName",
     "Learning",
+    "LearningConflict",
     "LearningScope",
     "NormalizedTurn",
     "NotFoundError",
     "SchemaError",
     "SessionDigest",
+    "SessionGap",
     "SessionPurpose",
 ]
 
