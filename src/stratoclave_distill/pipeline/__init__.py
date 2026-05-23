@@ -1,1 +1,41 @@
-"""Distiller / Curator / Aggregator pipeline (lands in Stage B)."""
+"""Distiller / Curator / Aggregator pipeline.
+
+Stage B exposes :class:`JsonlSessionReader` here so callers can iterate
+over a captured session without learning the module layout. Distiller
+and Curator land alongside it as their implementations are completed.
+"""
+
+from stratoclave_distill.pipeline.curator import (
+    CurationAction,
+    CurationOutcome,
+    Curator,
+    CuratorDecision,
+)
+from stratoclave_distill.pipeline.distiller import (
+    CandidateLearning,
+    DistillationResult,
+    Distiller,
+    build_distill_prompt,
+)
+from stratoclave_distill.pipeline.ingest import (
+    IngestReport,
+    IngestRunner,
+    SessionIngestResult,
+)
+from stratoclave_distill.pipeline.reader import JsonlSessionReader, SkippedLine
+
+__all__ = [
+    "CandidateLearning",
+    "CurationAction",
+    "CurationOutcome",
+    "Curator",
+    "CuratorDecision",
+    "DistillationResult",
+    "Distiller",
+    "IngestReport",
+    "IngestRunner",
+    "JsonlSessionReader",
+    "SessionIngestResult",
+    "SkippedLine",
+    "build_distill_prompt",
+]
