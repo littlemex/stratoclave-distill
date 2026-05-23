@@ -164,6 +164,4 @@ def test_migration_creates_and_drops_all_tables(db_url: str) -> None:
             )
             tables_after = {row[0] for row in cur.fetchall()}
             for required in REQUIRED_TABLES:
-                assert required not in tables_after, (
-                    f"downgrade left {required!r} behind"
-                )
+                assert required not in tables_after, f"downgrade left {required!r} behind"

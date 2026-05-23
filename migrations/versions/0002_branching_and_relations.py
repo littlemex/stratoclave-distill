@@ -55,9 +55,7 @@ def upgrade() -> None:
           ADD COLUMN closed_at TIMESTAMPTZ NULL
         """
     )
-    op.execute(
-        "CREATE INDEX idx_session_purposes_parent ON session_purposes(parent_session_id)"
-    )
+    op.execute("CREATE INDEX idx_session_purposes_parent ON session_purposes(parent_session_id)")
     op.execute(
         "CREATE INDEX idx_session_purposes_branch_state "
         "ON session_purposes(branch_state) WHERE branch_state <> 'closed'"

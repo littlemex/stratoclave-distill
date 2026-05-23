@@ -17,9 +17,7 @@ import pytest
 @pytest.fixture
 def stage_b_plus_migration() -> object:
     repo_root = Path(__file__).resolve().parents[2]
-    migration_path = (
-        repo_root / "migrations" / "versions" / "0002_branching_and_relations.py"
-    )
+    migration_path = repo_root / "migrations" / "versions" / "0002_branching_and_relations.py"
     assert migration_path.exists(), f"missing migration: {migration_path}"
 
     spec = importlib.util.spec_from_file_location("_distill_0002", migration_path)
@@ -36,9 +34,9 @@ def test_migration_has_revision_metadata(stage_b_plus_migration: object) -> None
 
 def _migration_source() -> str:
     repo_root = Path(__file__).resolve().parents[2]
-    return (
-        repo_root / "migrations" / "versions" / "0002_branching_and_relations.py"
-    ).read_text(encoding="utf-8")
+    return (repo_root / "migrations" / "versions" / "0002_branching_and_relations.py").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_branching_columns_added_with_defaults() -> None:
