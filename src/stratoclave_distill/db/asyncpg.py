@@ -37,6 +37,7 @@ from stratoclave_distill.core.errors import ConfigError
 from stratoclave_distill.core.types import (
     BranchState,
     ConflictResolution,
+    GroupLearning,
     Learning,
     LearningConflict,
     LearningScope,
@@ -44,7 +45,11 @@ from stratoclave_distill.core.types import (
     SessionGap,
     SessionPurpose,
 )
-from stratoclave_distill.db.stores import LearningSearchHit, RetrievalLane
+from stratoclave_distill.db.stores import (
+    GroupLearningSearchHit,
+    LearningSearchHit,
+    RetrievalLane,
+)
 
 
 def _normalize_dsn(database_url: str) -> str:
@@ -217,6 +222,23 @@ def _row_to_learning(row: Any) -> Learning:
         created_at=_from_datetime(row["created_at"]),
         updated_at=_from_datetime(row["updated_at"]),
         claim_type=claim_type_raw,
+    )
+
+
+def _row_to_group_learning(row: Any) -> GroupLearning:
+    contributing_raw = row["contributing_learnings"]
+    contributing = (
+        json.loads(contributing_raw)
+        if isinstance(contributing_raw, str)
+        else contributing_raw or []
+    )
+    return GroupLearning(
+        group_learning_id=str(row["group_learning_id"]),
+        group_id=str(row["group_id"]),
+        summary_md=row["summary_md"],
+        contributing_learnings=tuple(str(c) for c in contributing),
+        bm25_text=row["bm25_text"],
+        created_at=_from_datetime(row["created_at"]),
     )
 
 
@@ -630,6 +652,161 @@ class AsyncpgLearningStore:
         return tuple(hits)
 
 
+class AsyncpgGroupLearningStore:
+    """asyncpg-backed :class:`GroupLearningStore`.
+
+    The ``group_learnings`` table was reserved by migration 0001 with the
+    columns this store needs (``group_learning_id`` PK, ``group_id``,
+    ``summary_md``, ``contributing_learnings`` JSONB, ``embedding``,
+    ``bm25_text`` + generated ``bm25_tsv``, ``created_at``). HNSW and GIN
+    indexes are also already in place.
+
+    A re-aggregation produces a *new* ``group_learning_id`` and inserts
+    a fresh row; the previous row is not deleted so the history can be
+    audited. :meth:`list_by_group` with ``latest_only=True`` (the default)
+    returns just the most recent row per group.
+    """
+
+    __slots__ = ("_pool",)
+
+    def __init__(self, pool: Any) -> None:
+        self._pool = pool
+
+    async def upsert(
+        self,
+        group_learning: GroupLearning,
+        *,
+        embedding: Sequence[float],
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO group_learnings (
+                    group_learning_id, group_id, summary_md,
+                    contributing_learnings, embedding, bm25_text, created_at
+                ) VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
+                ON CONFLICT (group_learning_id) DO UPDATE SET
+                    group_id = EXCLUDED.group_id,
+                    summary_md = EXCLUDED.summary_md,
+                    contributing_learnings = EXCLUDED.contributing_learnings,
+                    embedding = EXCLUDED.embedding,
+                    bm25_text = EXCLUDED.bm25_text,
+                    created_at = EXCLUDED.created_at
+                """,
+                group_learning.group_learning_id,
+                group_learning.group_id,
+                group_learning.summary_md,
+                json.dumps(list(group_learning.contributing_learnings)),
+                list(embedding),
+                group_learning.bm25_text,
+                _to_datetime(group_learning.created_at),
+            )
+
+    async def get(self, group_learning_id: str) -> GroupLearning | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM group_learnings WHERE group_learning_id = $1",
+                group_learning_id,
+            )
+        return _row_to_group_learning(row) if row is not None else None
+
+    async def list_by_group(
+        self,
+        group_id: str,
+        *,
+        latest_only: bool = True,
+    ) -> Sequence[GroupLearning]:
+        async with self._pool.acquire() as conn:
+            if latest_only:
+                rows = await conn.fetch(
+                    "SELECT * FROM group_learnings WHERE group_id = $1 "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    group_id,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM group_learnings WHERE group_id = $1 ORDER BY created_at DESC",
+                    group_id,
+                )
+        return tuple(_row_to_group_learning(r) for r in rows)
+
+    async def list_latest_per_group(self) -> Sequence[GroupLearning]:
+        """Return the newest rollup per ``group_id`` across the whole table."""
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT ON (group_id) * FROM group_learnings "
+                "ORDER BY group_id, created_at DESC"
+            )
+        result = [_row_to_group_learning(r) for r in rows]
+        result.sort(key=lambda g: g.created_at, reverse=True)
+        return tuple(result)
+
+    async def search_hybrid(
+        self,
+        *,
+        query_text: str,
+        query_vector: Sequence[float],
+        top_k: int = 5,
+        rrf_k: int = 60,
+    ) -> Sequence[GroupLearningSearchHit]:
+        # Mirrors ``LearningStore.search_hybrid`` but without lane / scope.
+        # ``latest`` deduplicates rollup history per group_id so the
+        # retrieval surface aligns with ``list_by_group(latest_only=True)``.
+        params: list[Any] = [list(query_vector), query_text, rrf_k]
+        sql = f"""
+        WITH latest AS (
+            SELECT DISTINCT ON (group_id) group_learning_id, group_id, embedding, bm25_tsv
+            FROM group_learnings
+            ORDER BY group_id, created_at DESC
+        ),
+        vec AS (
+            SELECT group_learning_id,
+                   1 - (embedding <=> $1) AS cosine,
+                   ROW_NUMBER() OVER (ORDER BY embedding <=> $1 ASC) AS vrank
+            FROM latest
+        ),
+        bm AS (
+            SELECT group_learning_id,
+                   ts_rank_cd(bm25_tsv, plainto_tsquery('simple', $2)) AS score,
+                   ROW_NUMBER() OVER (
+                       ORDER BY ts_rank_cd(bm25_tsv, plainto_tsquery('simple', $2)) DESC
+                   ) AS brank
+            FROM latest
+            WHERE bm25_tsv @@ plainto_tsquery('simple', $2)
+        ),
+        fused AS (
+            SELECT v.group_learning_id,
+                   v.cosine,
+                   v.vrank,
+                   b.brank,
+                   (1.0 / ($3 + v.vrank)) +
+                   COALESCE(1.0 / ($3 + b.brank), 0.0) AS rrf
+            FROM vec v
+            LEFT JOIN bm b USING (group_learning_id)
+        )
+        SELECT g.*, f.cosine, f.vrank, f.brank, f.rrf
+        FROM fused f
+        JOIN group_learnings g USING (group_learning_id)
+        ORDER BY f.rrf DESC
+        LIMIT {int(top_k)}
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        hits: list[GroupLearningSearchHit] = []
+        for row in rows:
+            hits.append(
+                GroupLearningSearchHit(
+                    group=_row_to_group_learning(row),
+                    cosine=float(row["cosine"]),
+                    vector_rank=int(row["vrank"]),
+                    bm25_rank=int(row["brank"]) if row["brank"] is not None else None,
+                    rrf_score=float(row["rrf"]),
+                )
+            )
+        return tuple(hits)
+
+
 class AsyncpgConflictStore:
     """asyncpg-backed :class:`ConflictStore`."""
 
@@ -772,6 +949,7 @@ __all__ = [
     "AsyncpgConflictStore",
     "AsyncpgDigestStore",
     "AsyncpgGapStore",
+    "AsyncpgGroupLearningStore",
     "AsyncpgLearningStore",
     "AsyncpgPurposeStore",
     "AsyncpgWatermarkStore",

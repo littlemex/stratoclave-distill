@@ -31,6 +31,7 @@ from stratoclave_distill.core.errors import EmbeddingError
 from stratoclave_distill.core.types import (
     BranchState,
     ConflictResolution,
+    GroupLearning,
     Learning,
     LearningConflict,
     LearningScope,
@@ -38,7 +39,11 @@ from stratoclave_distill.core.types import (
     SessionGap,
     SessionPurpose,
 )
-from stratoclave_distill.db.stores import LearningSearchHit, RetrievalLane
+from stratoclave_distill.db.stores import (
+    GroupLearningSearchHit,
+    LearningSearchHit,
+    RetrievalLane,
+)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -395,6 +400,131 @@ class InMemoryLearningStore:
         return tuple(hits[:top_k])
 
 
+class InMemoryGroupLearningStore:
+    """In-memory :class:`GroupLearningStore` keyed by ``group_learning_id``.
+
+    Stores embeddings and pre-tokenized BM25 text alongside each rollup so
+    that :meth:`search_hybrid` can mirror the asyncpg shape: vector
+    similarity + BM25 token overlap fused via Reciprocal Rank Fusion.
+
+    ``list_by_group`` with ``latest_only=True`` returns only the most
+    recently created rollup for a group_id, which is the shape the
+    Retriever wants when packing a context bundle. ``latest_only=False``
+    surfaces the full history for audit / debugging.
+    """
+
+    __slots__ = ("_embeddings", "_lock", "_rows", "_tokens")
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._rows: dict[str, GroupLearning] = {}
+        self._embeddings: dict[str, tuple[float, ...]] = {}
+        self._tokens: dict[str, list[str]] = {}
+
+    async def upsert(
+        self,
+        group_learning: GroupLearning,
+        *,
+        embedding: Sequence[float],
+    ) -> None:
+        async with self._lock:
+            self._rows[group_learning.group_learning_id] = group_learning
+            self._embeddings[group_learning.group_learning_id] = tuple(embedding)
+            self._tokens[group_learning.group_learning_id] = _tokenize(
+                group_learning.bm25_text or group_learning.summary_md
+            )
+
+    async def get(self, group_learning_id: str) -> GroupLearning | None:
+        async with self._lock:
+            return self._rows.get(group_learning_id)
+
+    async def list_by_group(
+        self,
+        group_id: str,
+        *,
+        latest_only: bool = True,
+    ) -> Sequence[GroupLearning]:
+        async with self._lock:
+            matches = [row for row in self._rows.values() if row.group_id == group_id]
+        if not matches:
+            return ()
+        matches.sort(key=lambda r: r.created_at, reverse=True)
+        if latest_only:
+            return (matches[0],)
+        return tuple(matches)
+
+    async def list_latest_per_group(self) -> Sequence[GroupLearning]:
+        """Return the newest rollup per ``group_id``, sorted by ``created_at`` DESC."""
+
+        async with self._lock:
+            latest: dict[str, GroupLearning] = {}
+            for row in self._rows.values():
+                cur = latest.get(row.group_id)
+                if cur is None or row.created_at > cur.created_at:
+                    latest[row.group_id] = row
+        return tuple(sorted(latest.values(), key=lambda r: r.created_at, reverse=True))
+
+    async def search_hybrid(
+        self,
+        *,
+        query_text: str,
+        query_vector: Sequence[float],
+        top_k: int = 5,
+        rrf_k: int = 60,
+    ) -> Sequence[GroupLearningSearchHit]:
+        async with self._lock:
+            if not self._rows:
+                return ()
+            # Group rollups have no archived state; every row participates.
+            # When multiple rollups exist for the same group_id we keep
+            # only the latest so the search surface mirrors the
+            # ``latest_only=True`` retrieval default.
+            latest_per_group: dict[str, GroupLearning] = {}
+            for row in self._rows.values():
+                cur = latest_per_group.get(row.group_id)
+                if cur is None or row.created_at > cur.created_at:
+                    latest_per_group[row.group_id] = row
+            active = [(row.group_learning_id, row) for row in latest_per_group.values()]
+
+            cosines: dict[str, float] = {}
+            for gid, _row in active:
+                cosines[gid] = _cosine(query_vector, self._embeddings[gid])
+
+            query_tokens = _tokenize(query_text)
+            bm25: dict[str, float] = {}
+            for gid, _row in active:
+                bm25[gid] = _bm25_lite(query_tokens, self._tokens.get(gid, []))
+
+        vec_ranked = sorted(cosines.items(), key=lambda kv: kv[1], reverse=True)
+        bm25_ranked = sorted(
+            (kv for kv in bm25.items() if kv[1] > 0.0),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        vec_rank: dict[str, int] = {gid: i + 1 for i, (gid, _) in enumerate(vec_ranked)}
+        bm25_rank: dict[str, int] = {gid: i + 1 for i, (gid, _) in enumerate(bm25_ranked)}
+
+        hits: list[GroupLearningSearchHit] = []
+        for gid, row in active:
+            vr = vec_rank[gid]
+            br = bm25_rank.get(gid)
+            rrf = 1.0 / (rrf_k + vr)
+            if br is not None:
+                rrf += 1.0 / (rrf_k + br)
+            hits.append(
+                GroupLearningSearchHit(
+                    group=row,
+                    cosine=cosines[gid],
+                    vector_rank=vr,
+                    bm25_rank=br,
+                    rrf_score=rrf,
+                )
+            )
+
+        hits.sort(key=lambda h: h.rrf_score, reverse=True)
+        return tuple(hits[:top_k])
+
+
 class InMemoryConflictStore:
     """In-memory :class:`ConflictStore` keyed by ``conflict_id``."""
 
@@ -499,6 +629,7 @@ __all__ = [
     "InMemoryConflictStore",
     "InMemoryDigestStore",
     "InMemoryGapStore",
+    "InMemoryGroupLearningStore",
     "InMemoryLearningStore",
     "InMemoryPurposeStore",
     "InMemoryWatermarkStore",

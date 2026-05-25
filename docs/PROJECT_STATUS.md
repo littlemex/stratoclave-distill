@@ -1,11 +1,15 @@
 # stratoclave-distill: Implementation Status
 
-**Last updated**: 2026-05-23
+**Last updated**: 2026-05-25
 **Project started**: 2026-05-22
-**Current stage**: Stage C P0 surface implemented (query / pack / export
-/ gc CLI). Stage B+ engine shipped via PR #4. The retriever surface,
-`ContextPacker`, JSON export, and dry-run-by-default GC land in this PR.
-Next: Stage C P1 (conflict / gap CLI, Aggregator).
+**Current stage**: Stage D shipped (Aggregator + group rollup pipeline).
+The `Aggregator` produces one `GroupLearning` per group_id from the LLM,
+`AsyncpgGroupLearningStore` persists it (audit-trail preserving), the
+`Retriever` exposes the latest rollup per group, and the `ContextPacker`
+emits a `## Group rollups` section above the canonical / emerging lanes.
+A new `aggregate run --group-id <id> [--dry-run]` and `aggregate list`
+CLI complete the operator surface. Stage A/B/B+/C all remain green.
+Next: Stage E (conflict / gap CLI, MCP / HTTP servers).
 
 ## Overall progress
 
@@ -35,7 +39,12 @@ Next: Stage C P1 (conflict / gap CLI, Aggregator).
 | `query` CLI (`--lane / --limit / --pack / --token-budget / --dry-run`) | unit (dry-run) | done | Wraps `Retriever.retrieve()`; JSON or Markdown output |
 | `export` CLI (`<session_id> [--include-archived] [--include-side-relations]`) | unit (smoke) | done | Dumps purpose + digest + learnings (+ conflicts / gaps) as JSON |
 | `gc` CLI (`--older-than-days N [--apply]`) | unit (smoke) | done | Dry-run by default; DELETE only behind explicit `--apply` |
-| `Aggregator` (group rollup)    | -     | planned    | Stage C P1 |
+| `GroupLearning` dataclass + `GroupLearningStore` Protocol | unit | done | Frozen, slots; `upsert / get / list_by_group / list_latest_per_group / search_hybrid` |
+| `InMemoryGroupLearningStore` / `AsyncpgGroupLearningStore` | unit + integration | done | RRF over latest-per-group; HNSW + GIN indexes ready in migration `0001` |
+| `Aggregator` (group rollup)    | unit  | done       | One LLM call → one embedding → one `AggregationResult`; audit-preserving (re-aggregate appends a new row) |
+| `Retriever.groups`             | unit  | done       | Surfaces the latest rollup per `group_id`; cosine + BM25 RRF, configurable `top_k_groups` |
+| `ContextPacker` group section  | unit  | done       | `## Group rollups` H2 emitted before canonical / emerging; oversized rollups dropped atomically |
+| `aggregate run / aggregate list` CLI | unit (dry-run, env-gating) | done | `--group-id` validated; `aggregate list [--group <id>]` falls through to `list_latest_per_group` |
 
 ### Integration status
 
@@ -144,17 +153,63 @@ Next: Stage C P1 (conflict / gap CLI, Aggregator).
   it, only counts are reported. Negative ages are rejected at the
   CLI parser level.
 
-### Test surface (Stage A + B + B+ + C P0)
+### Stage D — Aggregator + group rollup (this PR)
 
-- 300 passing unit tests; 16 integration tests gated on
-  `DISTILL_TEST_DATABASE_URL`. Stage C added 15 ContextPacker tests
-  and 8 CLI tests (query dry-run JSON / Markdown, lane filter, limit
-  validation, prod env-var gating; export and gc env-var / argument
-  validation).
+- New public type `GroupLearning` (frozen, slots): a per-group rollup
+  with `group_learning_id`, `group_id`, `summary_md`,
+  `contributing_learnings`, `bm25_text`, `created_at`. The `embedding`
+  rides alongside the dataclass via a separate kwarg on the store
+  contract so `GroupLearning` itself stays JSON-friendly.
+- `GroupLearningStore` Protocol: `upsert / get / list_by_group /
+  list_latest_per_group / search_hybrid`. Re-aggregation produces a
+  *new* `group_learning_id` and inserts a fresh row so the audit
+  trail survives; `latest_only=True` (default) on `list_by_group` and
+  the `DISTINCT ON (group_id)` dedup inside `search_hybrid` keep the
+  retrieval surface aligned with the most recent rollup per group.
+- `InMemoryGroupLearningStore` and `AsyncpgGroupLearningStore` both
+  implement the Protocol; the asyncpg path uses the `group_learnings`
+  table reserved by migration `0001` (HNSW vector index + GIN tsvector
+  index already present, no new migration needed).
+- `Aggregator` pipeline: single LLM call returning one JSON object
+  `{"summary_md": str, "bm25_text": str}`, single embedding call,
+  deterministic dataclass output. Caller selects which `Learning`
+  rows to feed (e.g. `LearningStore.list_active` filtered by
+  `group_id`); the Aggregator raises `LLMError` on degenerate input
+  (empty group_id, no learnings, or learning whose `group_id` does
+  not match).
+- `Retriever` extended: `RetrievalResult.groups` carries the latest
+  rollup per `group_id`; `top_k_groups` (default 3) is configurable
+  and shares the `rrf_k` constant with the per-row hybrid search.
+- `ContextPacker` extended: a `## Group rollups` H2 is emitted
+  immediately after the title / query echo and before the lane loop,
+  with one `### Group rollup: <group_id> [<group_learning_id>]` H3
+  per rollup. Oversized rollups are dropped atomically (no partial
+  blocks); the lane loop continues admitting hits with the remaining
+  budget.
+- CLI: `aggregate run --group-id <id> [--dry-run]` runs the pipeline
+  and either prints the result envelope (dry-run; uses an in-memory
+  fixture and a deterministic stub LLM response so smoke tests
+  produce stable JSON) or persists via `AsyncpgGroupLearningStore`
+  (prod path; honors `DistillerConfig.from_env`). `aggregate list
+  [--group <id>]` falls through to either `list_by_group(latest_only=
+  False)` (history for one group) or `list_latest_per_group()` (one
+  row per group across the whole table).
+
+### Test surface (Stage A + B + B+ + C + D)
+
+- 338 passing unit tests; 21 integration tests gated on
+  `DISTILL_TEST_DATABASE_URL` (Stage D adds 6: round-trip, latest
+  per group, history audit, hybrid search dedup-to-latest, two-group
+  ranking, and `Aggregator → AsyncpgGroupLearningStore.upsert`
+  end-to-end). Stage D unit tests added: 14 group-learning store
+  tests, 12 Aggregator tests, 5 retriever group-tier tests, 4
+  packer group-section tests, and 3 CLI aggregate tests.
 - Integration coverage exercises both alembic round-trips, the asyncpg
   store contracts (Watermark / Purpose / Digest / Learning / Conflict
-  / Gap), `search_hybrid` lane filtering, and the branching round-trip
-  on `PurposeStore`.
+  / Gap / GroupLearning), `search_hybrid` lane filtering, the
+  branching round-trip on `PurposeStore`, and the full Aggregator →
+  GroupLearningStore round-trip with the StubLLM / StubEmbedding
+  providers and a real pgvector index.
 
 ## Technical highlights
 
@@ -179,9 +234,8 @@ Next: Stage C P1 (conflict / gap CLI, Aggregator).
 
 | Priority | Item | Stage |
 |----------|------|-------|
-| P1 | Conflict / gap CLI (`conflict list/resolve`, `gap list/resolve`) | C |
-| P1 | Aggregator group rollup (`group_learnings`)                      | C |
-| P1 | Token budget: tiktoken-backed counter as opt-in extra            | C |
+| P1 | Conflict / gap CLI (`conflict list/resolve`, `gap list/resolve`) | E |
+| P1 | Token budget: tiktoken-backed counter as opt-in extra            | E |
 | P2 | Optional MCP server                                              | v0.x |
 | P2 | Optional FastAPI HTTP server                                     | v0.x |
 
@@ -193,11 +247,14 @@ Next: Stage C P1 (conflict / gap CLI, Aggregator).
 
 ## Next steps
 
-1. Land Stage B+ engine (this PR): types, stores, Distiller, Curator,
-   Retriever, branch CLI, tests.
-2. Begin Stage C: wire the existing `Retriever` into a CLI `query`
-   subcommand with `--lane canonical/emerging` and JSON / table
-   rendering.
-3. Implement `ContextPacker` with token-budget eviction.
-4. Add `conflict list/resolve` and `gap list/resolve` CLI surfaces so
-   the new side-relations are reachable from the operator workflow.
+1. Land Stage D (this PR): `GroupLearning` types, `GroupLearningStore`
+   Protocol + InMemory + asyncpg, `Aggregator` pipeline, `Retriever`
+   group tier, `ContextPacker` group section, `aggregate run / list`
+   CLI, integration tests, docs refresh.
+2. Stage E P1: `conflict list/resolve` and `gap list/resolve` CLI so
+   the side-relations from Stage B+ are reachable from the operator
+   workflow.
+3. Stage E P1: opt-in `tiktoken`-backed `TokenCounter` extra so the
+   pack budget can match the deployed model exactly.
+4. v0.x: Optional MCP server and FastAPI HTTP server fronting the
+   existing pipeline + retriever surface.

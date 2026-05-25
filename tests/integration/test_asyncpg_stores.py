@@ -22,6 +22,7 @@ Postgres.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import uuid
@@ -31,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from stratoclave_distill.core.types import (
+    GroupLearning,
     Learning,
     LearningConflict,
     SessionDigest,
@@ -41,11 +43,15 @@ from stratoclave_distill.db.asyncpg import (
     AsyncpgConflictStore,
     AsyncpgDigestStore,
     AsyncpgGapStore,
+    AsyncpgGroupLearningStore,
     AsyncpgLearningStore,
     AsyncpgPurposeStore,
     AsyncpgWatermarkStore,
     pool_context,
 )
+from stratoclave_distill.pipeline.aggregator import Aggregator
+from stratoclave_distill.providers.embedding import StubEmbedding
+from stratoclave_distill.providers.llm import StubLLM
 
 pytestmark = pytest.mark.integration
 
@@ -577,3 +583,251 @@ async def test_gap_store_lifecycle(truncated_pool: object) -> None:
     assert resolved.resolved_by_learning == resolver_id
     unresolved_after = await store.list_unresolved(session_id=sid)
     assert all(g.gap_id != gid for g in unresolved_after)
+
+
+# --------------------------------------------------------------------------
+# Stage D -- group rollups (Aggregator + AsyncpgGroupLearningStore)
+# --------------------------------------------------------------------------
+
+
+def _grouped_learning(
+    *,
+    group_id: str,
+    rule: str,
+    bm25: str | None = None,
+    created_at: str = "2026-05-22T00:00:00Z",
+) -> Learning:
+    return Learning(
+        learning_id=_new_id(),
+        scope="group",  # type: ignore[arg-type]
+        rule=rule,
+        why="from a Stage D integration test",
+        triggers={"tag": "x"},
+        project_key=None,
+        group_id=group_id,
+        source_session=None,
+        source_version="v-test",
+        evidence_count=3,
+        confidence=0.8,
+        archived_at=None,
+        superseded_by=None,
+        bm25_text=bm25 or rule,
+        created_at=created_at,
+        updated_at=created_at,
+        claim_type="norm",
+    )
+
+
+async def test_group_learning_store_round_trip(truncated_pool: object) -> None:
+    store = AsyncpgGroupLearningStore(truncated_pool)
+    dim = _embedding_dim()
+    group_id = _new_id()
+    rollup = GroupLearning(
+        group_learning_id=_new_id(),
+        group_id=group_id,
+        summary_md="rollup body",
+        contributing_learnings=("L1", "L2"),
+        bm25_text="rollup body for bm25",
+        created_at="2026-05-22T00:00:00Z",
+    )
+    await store.upsert(rollup, embedding=[0.1] * dim)
+
+    fetched = await store.get(rollup.group_learning_id)
+    assert fetched is not None
+    assert fetched.group_id == group_id
+    assert fetched.contributing_learnings == ("L1", "L2")
+    assert fetched.summary_md == "rollup body"
+
+
+async def test_group_learning_list_by_group_latest_only(truncated_pool: object) -> None:
+    """Re-aggregation appends a new row; latest_only returns just the newest."""
+
+    store = AsyncpgGroupLearningStore(truncated_pool)
+    dim = _embedding_dim()
+    group_id = _new_id()
+    older = GroupLearning(
+        group_learning_id=_new_id(),
+        group_id=group_id,
+        summary_md="v1",
+        contributing_learnings=("L1",),
+        bm25_text="v1 body",
+        created_at="2026-05-20T00:00:00Z",
+    )
+    newer = GroupLearning(
+        group_learning_id=_new_id(),
+        group_id=group_id,
+        summary_md="v2",
+        contributing_learnings=("L1", "L2"),
+        bm25_text="v2 body",
+        created_at="2026-05-25T00:00:00Z",
+    )
+    await store.upsert(older, embedding=[0.1] * dim)
+    await store.upsert(newer, embedding=[0.2] * dim)
+
+    latest = await store.list_by_group(group_id, latest_only=True)
+    assert tuple(g.group_learning_id for g in latest) == (newer.group_learning_id,)
+
+    history = await store.list_by_group(group_id, latest_only=False)
+    assert tuple(g.group_learning_id for g in history) == (
+        newer.group_learning_id,
+        older.group_learning_id,
+    )
+
+    # Older row survives -- audit trail preserved.
+    audit = await store.get(older.group_learning_id)
+    assert audit is not None
+
+
+async def test_group_learning_list_latest_per_group(truncated_pool: object) -> None:
+    store = AsyncpgGroupLearningStore(truncated_pool)
+    dim = _embedding_dim()
+    group_c = _new_id()
+    group_d = _new_id()
+    rows = [
+        GroupLearning(
+            group_learning_id=_new_id(),
+            group_id=group_c,
+            summary_md="C v1",
+            contributing_learnings=("L1",),
+            bm25_text="C v1",
+            created_at="2026-05-20T00:00:00Z",
+        ),
+        GroupLearning(
+            group_learning_id=_new_id(),
+            group_id=group_c,
+            summary_md="C v2",
+            contributing_learnings=("L1", "L2"),
+            bm25_text="C v2",
+            created_at="2026-05-25T00:00:00Z",
+        ),
+        GroupLearning(
+            group_learning_id=_new_id(),
+            group_id=group_d,
+            summary_md="D only",
+            contributing_learnings=("L9",),
+            bm25_text="D only",
+            created_at="2026-05-22T00:00:00Z",
+        ),
+    ]
+    for r in rows:
+        await store.upsert(r, embedding=[0.1] * dim)
+
+    latest = await store.list_latest_per_group()
+    ids = {g.group_learning_id for g in latest}
+    # Two groups -- the older C row must not appear.
+    assert ids == {rows[1].group_learning_id, rows[2].group_learning_id}
+    # Sorted by created_at DESC: C v2 (2026-05-25) before D only (2026-05-22).
+    assert tuple(g.group_learning_id for g in latest) == (
+        rows[1].group_learning_id,
+        rows[2].group_learning_id,
+    )
+
+
+async def test_group_learning_search_hybrid_dedupes_to_latest_per_group(
+    truncated_pool: object,
+) -> None:
+    store = AsyncpgGroupLearningStore(truncated_pool)
+    group_id = _new_id()
+    older = GroupLearning(
+        group_learning_id=_new_id(),
+        group_id=group_id,
+        summary_md="old summary",
+        contributing_learnings=("L1",),
+        bm25_text="alpha old",
+        created_at="2026-05-20T00:00:00Z",
+    )
+    newer = GroupLearning(
+        group_learning_id=_new_id(),
+        group_id=group_id,
+        summary_md="new summary",
+        contributing_learnings=("L1", "L2"),
+        bm25_text="alpha new",
+        created_at="2026-05-25T00:00:00Z",
+    )
+    await store.upsert(older, embedding=_vec(1.0))
+    await store.upsert(newer, embedding=_vec(0.99))
+
+    hits = await store.search_hybrid(
+        query_text="alpha",
+        query_vector=_vec(1.0),
+        top_k=5,
+    )
+    assert len(hits) == 1
+    assert hits[0].group.group_learning_id == newer.group_learning_id
+    assert hits[0].vector_rank == 1
+
+
+async def test_group_learning_search_hybrid_ranks_two_groups(truncated_pool: object) -> None:
+    store = AsyncpgGroupLearningStore(truncated_pool)
+    near = GroupLearning(
+        group_learning_id=_new_id(),
+        group_id=_new_id(),
+        summary_md="alpha rollup",
+        contributing_learnings=("L1",),
+        bm25_text="alpha banana",
+        created_at="2026-05-22T00:00:00Z",
+    )
+    far = GroupLearning(
+        group_learning_id=_new_id(),
+        group_id=_new_id(),
+        summary_md="zeta rollup",
+        contributing_learnings=("L2",),
+        bm25_text="zeta cougar",
+        created_at="2026-05-22T00:00:00Z",
+    )
+    await store.upsert(near, embedding=_vec(1.0))
+    await store.upsert(far, embedding=_vec(-1.0))
+
+    hits = await store.search_hybrid(
+        query_text="alpha",
+        query_vector=_vec(1.0),
+        top_k=2,
+    )
+    assert hits[0].group.group_learning_id == near.group_learning_id
+    assert hits[0].cosine == pytest.approx(1.0, abs=1e-6)
+    assert hits[0].bm25_rank == 1
+
+
+async def test_aggregator_persists_via_asyncpg_store(truncated_pool: object) -> None:
+    """Aggregator -> AsyncpgGroupLearningStore.upsert end-to-end."""
+
+    learning_store = AsyncpgLearningStore(truncated_pool)
+    group_store = AsyncpgGroupLearningStore(truncated_pool)
+
+    group_id = _new_id()
+    inputs = [
+        _grouped_learning(group_id=group_id, rule="commit before deploy"),
+        _grouped_learning(group_id=group_id, rule="lock asyncpg version"),
+    ]
+    dim = _embedding_dim()
+    for row in inputs:
+        await learning_store.insert(row, embedding=[0.1] * dim)
+
+    llm_response = json.dumps(
+        {
+            "summary_md": ("Group rollup\n\n- commit before deploy\n- lock asyncpg version"),
+            "bm25_text": "commit before deploy lock asyncpg version",
+        }
+    )
+    aggregator = Aggregator(
+        llm=StubLLM(responses=[llm_response]),
+        embedder=StubEmbedding(dimension=dim),
+        clock=lambda: "2026-05-25T12:00:00Z",
+    )
+    result = await aggregator.run(inputs, group_id=group_id)
+    await group_store.upsert(result.group_learning, embedding=result.embedding)
+
+    fetched = await group_store.get(result.group_learning.group_learning_id)
+    assert fetched is not None
+    assert fetched.group_id == group_id
+    assert fetched.contributing_learnings == tuple(r.learning_id for r in inputs)
+    assert fetched.summary_md.startswith("Group rollup")
+
+    # Round-tripping via search must surface the freshly persisted rollup.
+    hits = await group_store.search_hybrid(
+        query_text="asyncpg",
+        query_vector=list(result.embedding),
+        top_k=3,
+    )
+    assert len(hits) == 1
+    assert hits[0].group.group_learning_id == result.group_learning.group_learning_id

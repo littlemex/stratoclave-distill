@@ -391,3 +391,38 @@ def test_gc_requires_database_url(
     rc = main(["gc"])
     assert rc == 2
     assert "DATABASE_URL is required" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# aggregate (Stage D)
+# --------------------------------------------------------------------------
+
+
+def test_aggregate_run_dry_run_emits_group_learning(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["aggregate", "run", "--group-id", "g-cli-test", "--dry-run"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    g = payload["group_learning"]
+    assert g["group_id"] == "g-cli-test"
+    assert g["contributing_learnings"] == ["L-dry-0", "L-dry-1"]
+    assert g["summary_md"].startswith("Group g-cli-test rollup")
+    assert payload["embedding_dim"] == 8
+
+
+def test_aggregate_run_rejects_empty_group_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["aggregate", "run", "--group-id", "", "--dry-run"])
+    assert rc == 2
+    assert "must be a non-empty string" in capsys.readouterr().err
+
+
+def test_aggregate_list_requires_database_url(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    rc = main(["aggregate", "list"])
+    assert rc == 2
+    assert "DATABASE_URL is required" in capsys.readouterr().err

@@ -35,6 +35,8 @@ from stratoclave_distill.core.types import (
 from stratoclave_distill.db.stores import (
     ConflictStore,
     GapStore,
+    GroupLearningSearchHit,
+    GroupLearningStore,
     LearningSearchHit,
     LearningStore,
 )
@@ -48,7 +50,9 @@ class RetrievalResult:
     ``canonical`` and ``emerging`` carry the same :class:`LearningSearchHit`
     shape; the split is the whole point of Stage B+. ``conflicts`` and
     ``gaps`` are sidecars: empty tuples when the retriever was constructed
-    without the corresponding stores.
+    without the corresponding stores. ``groups`` carries the latest rollup
+    per ``group_id`` from the Stage D Aggregator and is empty when no
+    :class:`GroupLearningStore` is wired.
     """
 
     query_text: str
@@ -56,6 +60,7 @@ class RetrievalResult:
     emerging: tuple[LearningSearchHit, ...]
     conflicts: tuple[LearningConflict, ...]
     gaps: tuple[SessionGap, ...]
+    groups: tuple[GroupLearningSearchHit, ...] = ()
 
     @property
     def all_hits(self) -> tuple[LearningSearchHit, ...]:
@@ -92,6 +97,11 @@ class Retriever:
     conflict_store / gap_store:
         Optional. When wired, :meth:`retrieve` populates ``conflicts`` and
         ``gaps`` on the result; otherwise those fields stay empty.
+    group_learning_store / top_k_groups:
+        Optional Stage D rollup store. When wired, :meth:`retrieve` issues
+        a parallel hybrid search against the group rollups and surfaces
+        the top ``top_k_groups`` hits on :attr:`RetrievalResult.groups`.
+        Defaults to ``None`` so existing callers keep working untouched.
     """
 
     __slots__ = (
@@ -100,10 +110,12 @@ class Retriever:
         "_conflict_store",
         "_embedder",
         "_gap_store",
+        "_group_learning_store",
         "_rrf_k",
         "_store",
         "_top_k_canonical",
         "_top_k_emerging",
+        "_top_k_groups",
     )
 
     def __init__(
@@ -113,16 +125,20 @@ class Retriever:
         *,
         top_k_canonical: int = 5,
         top_k_emerging: int = 5,
+        top_k_groups: int = 3,
         rrf_k: int = 60,
         canonical_min_evidence: int = 3,
         canonical_min_age_days: int = 14,
         conflict_store: ConflictStore | None = None,
         gap_store: GapStore | None = None,
+        group_learning_store: GroupLearningStore | None = None,
     ) -> None:
         if top_k_canonical < 1:
             raise ValueError(f"top_k_canonical must be >= 1, got {top_k_canonical}")
         if top_k_emerging < 1:
             raise ValueError(f"top_k_emerging must be >= 1, got {top_k_emerging}")
+        if top_k_groups < 1:
+            raise ValueError(f"top_k_groups must be >= 1, got {top_k_groups}")
         if rrf_k < 1:
             raise ValueError(f"rrf_k must be >= 1, got {rrf_k}")
         if canonical_min_evidence < 1:
@@ -133,11 +149,13 @@ class Retriever:
         self._embedder = embedder
         self._top_k_canonical = top_k_canonical
         self._top_k_emerging = top_k_emerging
+        self._top_k_groups = top_k_groups
         self._rrf_k = rrf_k
         self._canonical_min_evidence = canonical_min_evidence
         self._canonical_min_age_days = canonical_min_age_days
         self._conflict_store = conflict_store
         self._gap_store = gap_store
+        self._group_learning_store = group_learning_store
 
     async def retrieve(
         self,
@@ -197,12 +215,23 @@ class Retriever:
         if self._gap_store is not None:
             gaps = tuple(await self._gap_store.list_unresolved(session_id=gap_session_id))
 
+        groups: tuple[GroupLearningSearchHit, ...] = ()
+        if self._group_learning_store is not None:
+            group_hits = await self._group_learning_store.search_hybrid(
+                query_text=query_text,
+                query_vector=query_vector,
+                top_k=self._top_k_groups,
+                rrf_k=self._rrf_k,
+            )
+            groups = tuple(group_hits)
+
         return RetrievalResult(
             query_text=query_text,
             canonical=tuple(canonical),
             emerging=tuple(emerging),
             conflicts=conflicts,
             gaps=gaps,
+            groups=groups,
         )
 
 
