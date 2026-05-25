@@ -22,11 +22,12 @@ import pytest
 
 from stratoclave_distill.core.types import (
     ClaimType,
+    GroupLearning,
     Learning,
     LearningConflict,
     SessionGap,
 )
-from stratoclave_distill.db.stores import LearningSearchHit
+from stratoclave_distill.db.stores import GroupLearningSearchHit, LearningSearchHit
 from stratoclave_distill.retrieval import (
     ContextPacker,
     RetrievalResult,
@@ -62,12 +63,37 @@ def _hit(
     )
 
 
+def _group_hit(
+    group_learning_id: str,
+    *,
+    group_id: str,
+    summary_md: str,
+    rrf_score: float = 0.7,
+) -> GroupLearningSearchHit:
+    g = GroupLearning(
+        group_learning_id=group_learning_id,
+        group_id=group_id,
+        summary_md=summary_md,
+        contributing_learnings=(),
+        bm25_text=summary_md,
+        created_at="2026-05-25T00:00:00Z",
+    )
+    return GroupLearningSearchHit(
+        group=g,
+        cosine=0.95,
+        vector_rank=1,
+        bm25_rank=1,
+        rrf_score=rrf_score,
+    )
+
+
 def _result(
     *,
     canonical: Sequence[LearningSearchHit] = (),
     emerging: Sequence[LearningSearchHit] = (),
     conflicts: Sequence[LearningConflict] = (),
     gaps: Sequence[SessionGap] = (),
+    groups: Sequence[GroupLearningSearchHit] = (),
     query_text: str = "what should we do about flaky tests?",
 ) -> RetrievalResult:
     return RetrievalResult(
@@ -76,6 +102,7 @@ def _result(
         emerging=tuple(emerging),
         conflicts=tuple(conflicts),
         gaps=tuple(gaps),
+        groups=tuple(groups),
     )
 
 
@@ -299,3 +326,70 @@ def test_pack_uses_custom_token_counter() -> None:
     # + two learnings (1+1) = 6 tokens.
     assert pack.total_tokens == 6
     assert calls  # custom counter was actually used
+
+
+# --------------------------------------------------------------------------
+# Group rollups (Stage D)
+# --------------------------------------------------------------------------
+
+
+def test_pack_renders_group_rollups_before_canonical() -> None:
+    packer = ContextPacker(token_budget=10_000, title="Distilled")
+    result = _result(
+        groups=[
+            _group_hit("gl-1", group_id="g-A", summary_md="Group A rollup body."),
+        ],
+        canonical=[
+            _hit("L-1", rule="commit before deploy", claim_type="norm"),
+        ],
+    )
+    pack = packer.pack(result)
+    md = pack.markdown
+    assert "## Group rollups" in md
+    assert "### Group rollup: g-A [gl-1]" in md
+    assert "Group A rollup body." in md
+    # Section ordering: rollups precede the canonical lane.
+    assert md.index("## Group rollups") < md.index("## Canonical")
+    # Items contain the rollup with kind=group_learning.
+    kinds = [item.kind for item in pack.items]
+    assert kinds[0] == "group_learning"
+    assert pack.items[0].source_id == "gl-1"
+
+
+def test_pack_skips_groups_section_when_empty() -> None:
+    packer = ContextPacker(token_budget=10_000, title=None)
+    result = _result(
+        canonical=[_hit("L-1", rule="x", claim_type="norm")],
+    )
+    pack = packer.pack(result)
+    assert "## Group rollups" not in pack.markdown
+
+
+def test_pack_drops_oversized_group_rollup_but_keeps_others() -> None:
+    long_body = "x" * 800  # ~200 tokens at default 4 cpt
+    short_body = "tip"
+    result = _result(
+        groups=[
+            _group_hit("gl-long", group_id="g-A", summary_md=long_body),
+            _group_hit("gl-short", group_id="g-B", summary_md=short_body),
+        ],
+    )
+    packer = ContextPacker(token_budget=60, title=None)
+    pack = packer.pack(result)
+    ids = [item.source_id for item in pack.items if item.kind == "group_learning"]
+    assert "gl-long" not in ids
+    assert "gl-short" in ids
+    assert pack.total_tokens <= 60
+
+
+def test_pack_drops_groups_section_when_no_rollup_fits() -> None:
+    long_body = "x" * 4000  # way bigger than budget
+    result = _result(
+        groups=[_group_hit("gl-long", group_id="g-A", summary_md=long_body)],
+        canonical=[_hit("L-1", rule="rule", claim_type="norm")],
+    )
+    packer = ContextPacker(token_budget=80, title=None)
+    pack = packer.pack(result)
+    assert "## Group rollups" not in pack.markdown
+    # The canonical hit still gets rendered.
+    assert "L-1" in pack.markdown

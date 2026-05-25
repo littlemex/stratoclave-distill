@@ -1,6 +1,6 @@
 # stratoclave-distill: Getting Started Guide
 
-**Last updated**: 2026-05-23
+**Last updated**: 2026-05-25
 **Audience**: First-time contributors and operators
 
 ## Introduction
@@ -282,6 +282,77 @@ stratoclave-distill gc --older-than-days 30 --apply
 
 Negative ages are rejected at parse time, and the JSON output always
 echoes the `dry_run` flag so cron jobs can audit their own behavior.
+
+## Aggregate / group rollups (Stage D)
+
+Stage D is the second tier of the retrieval surface: every learning
+that shares a `group_id` is summarized into one `GroupLearning` rollup,
+the rollup is embedded once, and `query --pack` emits a `## Group
+rollups` section above the canonical / emerging lanes.
+
+### `aggregate run`: produce one rollup
+
+`aggregate run --group-id <id>` runs the full pipeline (load active
+learnings → filter by `group_id` → one LLM call → one embedding → one
+upsert) against the configured Postgres. A re-aggregation does not
+delete the previous row; it inserts a fresh `group_learning_id` so
+the audit trail survives.
+
+```bash
+stratoclave-distill aggregate run --group-id g-onboarding
+```
+
+`--dry-run` short-circuits the database and the LLM. The CLI seeds
+two fixture learnings, runs the Aggregator with a deterministic stub
+LLM response, and prints the resulting `GroupLearning` envelope. This
+is what smoke tests and downstream tooling rely on:
+
+```bash
+stratoclave-distill aggregate run --group-id g-demo --dry-run | jq .
+```
+
+Empty group ids are rejected at the CLI parser level (`rc=2`).
+
+### `aggregate list`: surface the latest rollup
+
+Without arguments `aggregate list` returns the *latest rollup per
+group* (one row per `group_id`, sorted newest first). With `--group
+<id>` it switches to the full history for that group_id, also newest
+first, so you can audit re-aggregation churn:
+
+```bash
+# Newest rollup for every group_id:
+stratoclave-distill aggregate list
+
+# Full re-aggregation history for one group:
+stratoclave-distill aggregate list --group g-onboarding
+```
+
+### How `query --pack` surfaces rollups
+
+When the configured `Retriever` is wired with a `GroupLearningStore`,
+the rollup tier is hybrid-searched alongside the per-row canonical /
+emerging lanes (cosine + BM25 RRF, with the same `rrf_k` constant).
+`ContextPacker` emits the rollups *before* the lane loop:
+
+```markdown
+# Distilled context
+
+_query_: flaky tests
+
+## Group rollups
+
+### Group rollup: g-onboarding [<group_learning_id>]
+
+<summary_md from the Aggregator>
+
+## Canonical
+...
+```
+
+Oversized rollups are dropped atomically (no half-block ever lands in
+the bundle); the lane loop continues admitting hits with whatever
+budget remains.
 
 ## Troubleshooting
 

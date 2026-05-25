@@ -5,6 +5,11 @@ over a captured session without learning the module layout. Distiller
 and Curator land alongside it as their implementations are completed.
 """
 
+from stratoclave_distill.pipeline.aggregator import (
+    AggregationResult,
+    Aggregator,
+    build_aggregate_prompt,
+)
 from stratoclave_distill.pipeline.curator import (
     ConflictJudge,
     ConflictVerdict,
@@ -28,6 +33,8 @@ from stratoclave_distill.pipeline.ingest import (
 from stratoclave_distill.pipeline.reader import JsonlSessionReader, SkippedLine
 
 __all__ = [
+    "AggregationResult",
+    "Aggregator",
     "BranchPlan",
     "CandidateLearning",
     "ConflictJudge",
@@ -43,5 +50,6 @@ __all__ = [
     "JsonlSessionReader",
     "SessionIngestResult",
     "SkippedLine",
+    "build_aggregate_prompt",
     "build_distill_prompt",
 ]

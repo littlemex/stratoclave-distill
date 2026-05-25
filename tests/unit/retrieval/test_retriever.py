@@ -20,10 +20,16 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from stratoclave_distill.core.errors import EmbeddingError
-from stratoclave_distill.core.types import Learning, LearningConflict, SessionGap
+from stratoclave_distill.core.types import (
+    GroupLearning,
+    Learning,
+    LearningConflict,
+    SessionGap,
+)
 from stratoclave_distill.db.memory import (
     InMemoryConflictStore,
     InMemoryGapStore,
+    InMemoryGroupLearningStore,
     InMemoryLearningStore,
 )
 from stratoclave_distill.retrieval import (
@@ -409,3 +415,138 @@ async def test_hits_for_learning_locates_match() -> None:
     assert hit is not None
     assert hit.learning.learning_id == "target"
     assert hits_for_learning(result.canonical, "missing") is None
+
+
+# --------------------------------------------------------------------------
+# Groups (Stage D rollups)
+# --------------------------------------------------------------------------
+
+
+def _group(
+    group_learning_id: str,
+    *,
+    group_id: str,
+    summary_md: str,
+    bm25_text: str | None = None,
+    contributing: tuple[str, ...] = (),
+    created_at: str = "2026-05-25T00:00:00Z",
+) -> GroupLearning:
+    return GroupLearning(
+        group_learning_id=group_learning_id,
+        group_id=group_id,
+        summary_md=summary_md,
+        contributing_learnings=contributing,
+        bm25_text=bm25_text if bm25_text is not None else summary_md,
+        created_at=created_at,
+    )
+
+
+def test_retriever_rejects_zero_top_k_groups() -> None:
+    store = InMemoryLearningStore()
+    embedder = _FixedEmbedder([1.0, 0.0])
+    with pytest.raises(ValueError, match=r"top_k_groups must be >= 1"):
+        Retriever(store, embedder, top_k_groups=0)
+
+
+@pytest.mark.asyncio
+async def test_groups_empty_when_no_group_store() -> None:
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("lid-1", rule="rule", bm25_text="rule", evidence_count=10),
+        embedding=[1.0, 0.0],
+    )
+    retriever = Retriever(store, _FixedEmbedder([1.0, 0.0]))
+    result = await retriever.retrieve("rule")
+    assert result.groups == ()
+
+
+@pytest.mark.asyncio
+async def test_groups_populated_when_group_store_wired() -> None:
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("lid-1", rule="rule", bm25_text="rule", evidence_count=10),
+        embedding=[1.0, 0.0],
+    )
+    groups = InMemoryGroupLearningStore()
+    await groups.upsert(
+        _group("gl-near", group_id="g-A", summary_md="commit early always"),
+        embedding=[1.0, 0.0],
+    )
+    await groups.upsert(
+        _group("gl-far", group_id="g-B", summary_md="other rollup"),
+        embedding=[0.0, 1.0],
+    )
+
+    retriever = Retriever(
+        store,
+        _FixedEmbedder([1.0, 0.0]),
+        group_learning_store=groups,
+        top_k_groups=2,
+    )
+    result = await retriever.retrieve("commit early")
+
+    assert len(result.groups) == 2
+    # Vector match ranks the gl-near rollup first.
+    assert result.groups[0].group.group_learning_id == "gl-near"
+    assert result.groups[0].cosine == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_groups_dedupe_to_latest_per_group_id() -> None:
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("lid-1", rule="rule", bm25_text="rule", evidence_count=10),
+        embedding=[1.0, 0.0],
+    )
+    groups = InMemoryGroupLearningStore()
+    await groups.upsert(
+        _group(
+            "gl-old",
+            group_id="g-A",
+            summary_md="old",
+            created_at="2026-05-20T00:00:00Z",
+        ),
+        embedding=[1.0, 0.0],
+    )
+    await groups.upsert(
+        _group(
+            "gl-new",
+            group_id="g-A",
+            summary_md="new",
+            created_at="2026-05-25T00:00:00Z",
+        ),
+        embedding=[1.0, 0.0],
+    )
+
+    retriever = Retriever(
+        store,
+        _FixedEmbedder([1.0, 0.0]),
+        group_learning_store=groups,
+    )
+    result = await retriever.retrieve("rule")
+    assert len(result.groups) == 1
+    assert result.groups[0].group.group_learning_id == "gl-new"
+
+
+@pytest.mark.asyncio
+async def test_groups_honor_top_k_groups() -> None:
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("lid-1", rule="rule", bm25_text="rule", evidence_count=10),
+        embedding=[1.0, 0.0],
+    )
+    groups = InMemoryGroupLearningStore()
+    for i in range(5):
+        await groups.upsert(
+            _group(f"gl-{i}", group_id=f"g-{i}", summary_md=f"rollup {i}"),
+            embedding=[1.0, 0.0],
+        )
+
+    retriever = Retriever(
+        store,
+        _FixedEmbedder([1.0, 0.0]),
+        group_learning_store=groups,
+        top_k_groups=2,
+    )
+    result = await retriever.retrieve("rollup")
+    assert len(result.groups) == 2

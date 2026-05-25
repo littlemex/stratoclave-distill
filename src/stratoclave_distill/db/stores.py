@@ -29,6 +29,7 @@ from typing import Literal, Protocol, runtime_checkable
 from stratoclave_distill.core.types import (
     BranchState,
     ConflictResolution,
+    GroupLearning,
     Learning,
     LearningConflict,
     LearningScope,
@@ -64,6 +65,23 @@ class LearningSearchHit:
     """
 
     learning: Learning
+    cosine: float
+    vector_rank: int
+    bm25_rank: int | None
+    rrf_score: float
+
+
+@dataclass(frozen=True, slots=True)
+class GroupLearningSearchHit:
+    """One result from :meth:`GroupLearningStore.search_hybrid`.
+
+    Mirrors :class:`LearningSearchHit` so the Retriever / Packer can treat
+    rollups uniformly with per-row learnings. Group rollups are always
+    treated as canonical (no lane gating), so there is no equivalent of
+    ``RetrievalLane`` here.
+    """
+
+    group: GroupLearning
     cosine: float
     vector_rank: int
     bm25_rank: int | None
@@ -181,6 +199,56 @@ class LearningStore(Protocol):
 
 
 @runtime_checkable
+class GroupLearningStore(Protocol):
+    """Stores Aggregator-produced :class:`GroupLearning` rollups.
+
+    A group rollup is a single LLM-rewritten summary of every active
+    learning that shares a ``group_id``. The store keeps the rollup, its
+    embedding, and the list of contributing ``learning_id``s so the
+    Retriever can join back to the source rows.
+
+    ``upsert`` is keyed on ``group_learning_id`` (one rollup per
+    Aggregator run) — a fresh re-aggregation produces a new id and
+    overwrites the previous row for the same ``group_id`` via
+    :meth:`list_by_group` semantics (the caller deletes the old one or
+    the store keeps both and the retriever reads the latest by
+    ``created_at``). The asyncpg implementation chooses the latter so
+    the audit trail is preserved.
+
+    ``search_hybrid`` mirrors :meth:`LearningStore.search_hybrid` minus
+    the lane / scope arguments: groups have no scope and are always
+    canonical.
+    """
+
+    async def upsert(
+        self,
+        group_learning: GroupLearning,
+        *,
+        embedding: Sequence[float],
+    ) -> None: ...
+
+    async def get(self, group_learning_id: str) -> GroupLearning | None: ...
+
+    async def list_by_group(
+        self,
+        group_id: str,
+        *,
+        latest_only: bool = True,
+    ) -> Sequence[GroupLearning]: ...
+
+    async def list_latest_per_group(self) -> Sequence[GroupLearning]: ...
+
+    async def search_hybrid(
+        self,
+        *,
+        query_text: str,
+        query_vector: Sequence[float],
+        top_k: int = 5,
+        rrf_k: int = 60,
+    ) -> Sequence[GroupLearningSearchHit]: ...
+
+
+@runtime_checkable
 class ConflictStore(Protocol):
     """Stores rows of :class:`LearningConflict`.
 
@@ -238,6 +306,8 @@ __all__ = [
     "ConflictStore",
     "DigestStore",
     "GapStore",
+    "GroupLearningSearchHit",
+    "GroupLearningStore",
     "LearningSearchHit",
     "LearningStore",
     "PurposeStore",

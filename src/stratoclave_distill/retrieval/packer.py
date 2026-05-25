@@ -34,7 +34,7 @@ from stratoclave_distill.core.types import (
     LearningConflict,
     SessionGap,
 )
-from stratoclave_distill.db.stores import LearningSearchHit
+from stratoclave_distill.db.stores import GroupLearningSearchHit, LearningSearchHit
 from stratoclave_distill.retrieval.retriever import RetrievalResult
 
 # Order in which claim types are rendered within a lane. ``norm`` first
@@ -122,6 +122,20 @@ def _format_learning_line(learning: Learning) -> str:
     return "".join(pieces)
 
 
+def _format_group_block(hit: GroupLearningSearchHit) -> tuple[str, str]:
+    """Render one group rollup as ``(heading, body)``.
+
+    The heading is the H3 the packer admits as a unit; the body is the
+    rollup's :attr:`GroupLearning.summary_md` verbatim. The packer then
+    decides whether the combined block fits the budget — partial rollups
+    would mislead the LLM, so it is all-or-nothing per group.
+    """
+
+    g = hit.group
+    heading = f"### Group rollup: {g.group_id} [{g.group_learning_id}]"
+    return heading, g.summary_md.strip()
+
+
 def _format_conflict_line(conflict: LearningConflict) -> str:
     return (
         f"- conflict between {conflict.from_id} and {conflict.to_id}"
@@ -187,7 +201,9 @@ class ContextPacker:
     def pack(self, result: RetrievalResult) -> ContextPack:
         """Render ``result`` as a budgeted :class:`ContextPack`.
 
-        The greedy admission strategy is intentionally simple: lanes are
+        The greedy admission strategy is intentionally simple: group
+        rollups (Stage D) come first because they are the synthesized
+        view a downstream prompt should anchor on; then lanes are
         traversed in canonical → emerging order, claim types in
         ``_CLAIM_TYPE_ORDER``, and within each bucket hits keep the
         retriever's RRF ordering. The first hit that does not fit causes
@@ -216,6 +232,14 @@ class ContextPacker:
                 lines.append(qline)
                 lines.append("")
                 used_tokens += tokens
+
+        if result.groups:
+            used_tokens, _ = self._emit_groups(
+                groups=result.groups,
+                used_tokens=used_tokens,
+                lines=lines,
+                items=items,
+            )
 
         for lane in (canonical, emerging):
             used_tokens, lane_added = self._emit_lane(
@@ -315,6 +339,60 @@ class ContextPacker:
             # Drop the bare lane heading we tentatively appended.
             lines.pop()
             used_tokens -= heading_tokens
+            return used_tokens, False
+        # Trailing blank line for readability.
+        lines.append("")
+        return used_tokens, True
+
+    def _emit_groups(
+        self,
+        *,
+        groups: Sequence[GroupLearningSearchHit],
+        used_tokens: int,
+        lines: list[str],
+        items: list[ContextPackItem],
+    ) -> tuple[int, bool]:
+        """Render the Stage D group-rollup section.
+
+        Each rollup is admitted as a unit (heading + ``summary_md`` body):
+        partial rollups would mislead the LLM, so a rollup that does not
+        fit the remaining budget is dropped wholesale and the loop
+        continues with the next rollup.
+        """
+
+        section_heading = "## Group rollups"
+        section_tokens = self._token_counter(section_heading)
+        if used_tokens + section_tokens > self._token_budget:
+            return used_tokens, False
+        lines.append(section_heading)
+        used_tokens += section_tokens
+
+        added_anything = False
+        for hit in groups:
+            heading, body = _format_group_block(hit)
+            block_text = f"{heading}\n{body}" if body else heading
+            block_tokens = self._token_counter(block_text)
+            if used_tokens + block_tokens > self._token_budget:
+                continue
+            lines.append(heading)
+            if body:
+                lines.append(body)
+            used_tokens += block_tokens
+            items.append(
+                ContextPackItem(
+                    kind="group_learning",
+                    source_id=hit.group.group_learning_id,
+                    text=block_text,
+                    score=hit.rrf_score,
+                    tokens=block_tokens,
+                )
+            )
+            added_anything = True
+
+        if not added_anything:
+            # Drop the bare section heading we tentatively appended.
+            lines.pop()
+            used_tokens -= section_tokens
             return used_tokens, False
         # Trailing blank line for readability.
         lines.append("")

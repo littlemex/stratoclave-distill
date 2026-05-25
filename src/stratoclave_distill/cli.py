@@ -42,6 +42,7 @@ from stratoclave_distill import __version__
 from stratoclave_distill.config import DistillerConfig
 from stratoclave_distill.core.errors import DistillError
 from stratoclave_distill.core.types import (
+    GroupLearning,
     Learning,
     LearningConflict,
     LearningScope,
@@ -57,8 +58,10 @@ from stratoclave_distill.db.memory import (
     InMemoryPurposeStore,
     InMemoryWatermarkStore,
 )
-from stratoclave_distill.db.stores import LearningSearchHit
+from stratoclave_distill.db.stores import GroupLearningSearchHit, LearningSearchHit
 from stratoclave_distill.pipeline import (
+    AggregationResult,
+    Aggregator,
     BranchPlan,
     Curator,
     Distiller,
@@ -266,6 +269,43 @@ def _build_parser() -> argparse.ArgumentParser:
             "Include open conflicts and unresolved gaps tied to the session "
             "(or to its learnings) in the exported document."
         ),
+    )
+
+    # ----- aggregate -----------------------------------------------------
+    aggregate_parser = sub.add_parser(
+        "aggregate",
+        help="Stage D group rollups (run / list).",
+    )
+    aggregate_sub = aggregate_parser.add_subparsers(dest="aggregate_command", required=True)
+
+    aggregate_run = aggregate_sub.add_parser(
+        "run",
+        help="Run the Aggregator over one group_id and emit a fresh group_learning.",
+    )
+    aggregate_run.add_argument(
+        "--group-id",
+        required=True,
+        help="group_id to roll up; all active learnings tagged with this group_id are fed in.",
+    )
+    aggregate_run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run with in-memory stores and stub providers. The CLI seeds two "
+            "fixture learnings into the in-memory store so the prompt + parser "
+            "path is exercised without a database / LLM."
+        ),
+    )
+
+    aggregate_list = aggregate_sub.add_parser(
+        "list",
+        help="List the latest rollup per group_id, or the full history of one group.",
+    )
+    aggregate_list.add_argument(
+        "--group",
+        default=None,
+        metavar="GROUP_ID",
+        help="If set, list every rollup for this group_id (newest first).",
     )
 
     # ----- gc ------------------------------------------------------------
@@ -696,6 +736,21 @@ def _serialize_hit(hit: LearningSearchHit) -> dict[str, object]:
     }
 
 
+def _serialize_group_hit(hit: GroupLearningSearchHit) -> dict[str, object]:
+    g = hit.group
+    return {
+        "group_learning_id": g.group_learning_id,
+        "group_id": g.group_id,
+        "summary_md": g.summary_md,
+        "contributing_learnings": list(g.contributing_learnings),
+        "created_at": g.created_at,
+        "cosine": hit.cosine,
+        "vector_rank": hit.vector_rank,
+        "bm25_rank": hit.bm25_rank,
+        "rrf_score": hit.rrf_score,
+    }
+
+
 def _serialize_retrieval(result: RetrievalResult) -> dict[str, object]:
     return {
         "query_text": result.query_text,
@@ -703,6 +758,7 @@ def _serialize_retrieval(result: RetrievalResult) -> dict[str, object]:
         "emerging": [_serialize_hit(h) for h in result.emerging],
         "conflicts": [asdict(c) for c in result.conflicts],
         "gaps": [asdict(g) for g in result.gaps],
+        "groups": [_serialize_group_hit(h) for h in result.groups],
     }
 
 
@@ -1040,6 +1096,167 @@ def _cmd_export(
 
 
 # --------------------------------------------------------------------------
+# aggregate subcommand (Stage D)
+# --------------------------------------------------------------------------
+
+
+def _serialize_group_learning(g: GroupLearning) -> dict[str, object]:
+    return {
+        "group_learning_id": g.group_learning_id,
+        "group_id": g.group_id,
+        "summary_md": g.summary_md,
+        "contributing_learnings": list(g.contributing_learnings),
+        "bm25_text": g.bm25_text,
+        "created_at": g.created_at,
+    }
+
+
+def _serialize_aggregation(result: AggregationResult) -> dict[str, object]:
+    return {
+        "group_learning": _serialize_group_learning(result.group_learning),
+        "embedding_dim": len(result.embedding),
+    }
+
+
+def _dry_run_aggregate_responder(group_id: str) -> str:
+    """Canned LLM response for ``aggregate run --dry-run``.
+
+    Echoes the requested ``group_id`` so smoke tests can assert the
+    dry-run envelope is wired through.
+    """
+
+    return json.dumps(
+        {
+            "summary_md": (
+                f"Group {group_id} rollup (dry-run).\n\n"
+                "- placeholder norm: stub aggregator output for fixture validation"
+            ),
+            "bm25_text": f"group {group_id} rollup placeholder norm",
+        }
+    )
+
+
+async def _run_dry_run_aggregate(
+    *,
+    group_id: str,
+    embedding_dim: int = 8,
+) -> AggregationResult:
+    """Aggregate with stub providers and an in-memory learnings store.
+
+    Seeds two fixture learnings tagged with ``group_id`` so the prompt
+    path exercises non-empty input. No database / LLM credentials are
+    required.
+    """
+
+    learnings_store = InMemoryLearningStore()
+    seeds = [
+        Learning(
+            learning_id=f"L-dry-{i}",
+            scope="group",
+            rule=f"dry-run rule {i}",
+            why="seeded by aggregate --dry-run",
+            group_id=group_id,
+            bm25_text=f"dry-run rule {i}",
+            claim_type="norm",
+            evidence_count=3,
+            created_at="2026-05-25T00:00:00Z",
+            updated_at="2026-05-25T00:00:00Z",
+        )
+        for i in range(2)
+    ]
+    for seed in seeds:
+        await learnings_store.insert(seed, embedding=[1.0] + [0.0] * (embedding_dim - 1))
+
+    llm = StubLLM(responses=[_dry_run_aggregate_responder(group_id)])
+    embedder = StubEmbedding(dimension=embedding_dim)
+    aggregator = Aggregator(llm, embedder)
+    return await aggregator.run(seeds, group_id=group_id)
+
+
+async def _run_prod_aggregate(*, group_id: str) -> AggregationResult:
+    """Aggregate against asyncpg-backed stores and the configured LLM.
+
+    Pulls every active learning whose ``group_id`` matches the request,
+    runs the Aggregator, and persists the rollup via
+    :meth:`GroupLearningStore.upsert`.
+    """
+
+    from stratoclave_distill.db.asyncpg import (
+        AsyncpgGroupLearningStore,
+        AsyncpgLearningStore,
+        pool_context,
+    )
+
+    cfg = DistillerConfig.from_env()
+    llm = build_llm_provider(cfg)
+    embedder = build_embedding_provider(cfg)
+    if embedder.dimension != cfg.embedding_dim:
+        raise DistillError(
+            f"embedding provider reports dimension {embedder.dimension} "
+            f"but DISTILL_EMBEDDING_DIM is {cfg.embedding_dim}"
+        )
+
+    aggregator = Aggregator(llm, embedder)
+    async with pool_context(cfg.database_url) as pool:
+        learnings_store = AsyncpgLearningStore(pool)
+        group_store = AsyncpgGroupLearningStore(pool)
+        all_active = await learnings_store.list_active()
+        learnings = [learning for learning in all_active if learning.group_id == group_id]
+        if not learnings:
+            raise DistillError(f"aggregate: no active learnings tagged group_id={group_id!r}")
+        result = await aggregator.run(learnings, group_id=group_id)
+        await group_store.upsert(result.group_learning, embedding=list(result.embedding))
+    return result
+
+
+async def _run_aggregate_list(*, group_id: str | None) -> list[dict[str, object]]:
+    from stratoclave_distill.db.asyncpg import (
+        AsyncpgGroupLearningStore,
+        pool_context,
+    )
+
+    cfg = DistillerConfig.from_env()
+    async with pool_context(cfg.database_url) as pool:
+        store = AsyncpgGroupLearningStore(pool)
+        if group_id is not None:
+            rows = await store.list_by_group(group_id, latest_only=False)
+        else:
+            rows = await store.list_latest_per_group()
+    return [_serialize_group_learning(g) for g in rows]
+
+
+def _cmd_aggregate_run(*, group_id: str, dry_run: bool) -> int:
+    if not group_id:
+        sys.stderr.write("error: --group-id must be a non-empty string\n")
+        return 2
+    try:
+        if dry_run:
+            result = asyncio.run(_run_dry_run_aggregate(group_id=group_id))
+        else:
+            result = asyncio.run(_run_prod_aggregate(group_id=group_id))
+    except DistillError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
+    sys.stdout.write(json.dumps(_serialize_aggregation(result), indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+    return 0
+
+
+def _cmd_aggregate_list(*, group_id: str | None) -> int:
+    try:
+        rows = asyncio.run(_run_aggregate_list(group_id=group_id))
+    except DistillError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
+    sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # gc subcommand
 # --------------------------------------------------------------------------
 
@@ -1174,6 +1391,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             include_archived=args.include_archived,
             include_side_relations=args.include_side_relations,
         )
+    if args.command == "aggregate":
+        if args.aggregate_command == "run":
+            return _cmd_aggregate_run(group_id=args.group_id, dry_run=args.dry_run)
+        if args.aggregate_command == "list":
+            return _cmd_aggregate_list(group_id=args.group)
+        parser.error(f"unknown aggregate command: {args.aggregate_command}")  # pragma: no cover
     if args.command == "gc":
         return _cmd_gc(older_than_days=args.older_than_days, apply=args.apply)
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
