@@ -571,11 +571,14 @@ class AsyncpgLearningStore:
         lane: RetrievalLane = "all",
         canonical_min_evidence: int = 3,
         canonical_min_age_days: int = 14,
+        source_session_ids: Sequence[str] | None = None,
     ) -> Sequence[LearningSearchHit]:
         # We pass the vector as a list[float]; pgvector codec converts.
         # ``ts_rank_cd`` is positive when there is any token overlap;
         # rows with no BM25 hit get ``bm25_rank = NULL`` so the Curator
         # can distinguish "vector-only" matches.
+        if source_session_ids is not None and len(source_session_ids) == 0:
+            return ()
         params: list[Any] = [list(query_vector), query_text, rrf_k]
         scope_filter = ""
         if scope is not None:
@@ -597,6 +600,11 @@ class AsyncpgLearningStore:
                 f"AND {canonical_pred}" if lane == "canonical" else f"AND NOT {canonical_pred}"
             )
 
+        session_filter = ""
+        if source_session_ids is not None:
+            params.append(list(source_session_ids))
+            session_filter = f"AND source_session = ANY(${len(params)}::text[])"
+
         sql = f"""
         WITH active AS (
             SELECT learning_id, embedding, bm25_tsv, bm25_text
@@ -604,6 +612,7 @@ class AsyncpgLearningStore:
             WHERE archived_at IS NULL
             {scope_filter}
             {lane_filter}
+            {session_filter}
         ),
         vec AS (
             SELECT learning_id,

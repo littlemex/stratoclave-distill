@@ -331,7 +331,13 @@ class InMemoryLearningStore:
         lane: RetrievalLane = "all",
         canonical_min_evidence: int = 3,
         canonical_min_age_days: int = 14,
+        source_session_ids: Sequence[str] | None = None,
     ) -> Sequence[LearningSearchHit]:
+        if source_session_ids is not None and len(source_session_ids) == 0:
+            return ()
+        allowed_sessions: set[str] | None = (
+            set(source_session_ids) if source_session_ids is not None else None
+        )
         cutoff = datetime.now(UTC) - timedelta(days=canonical_min_age_days)
 
         def _row_in_lane(row: Learning) -> bool:
@@ -354,6 +360,7 @@ class InMemoryLearningStore:
                 for lid, row in self._rows.items()
                 if row.archived_at is None
                 and (scope is None or row.scope == scope)
+                and (allowed_sessions is None or row.source_session in allowed_sessions)
                 and _row_in_lane(row)
             ]
             if not active:

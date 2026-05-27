@@ -195,7 +195,16 @@ class LearningStore(Protocol):
         lane: RetrievalLane = "all",
         canonical_min_evidence: int = 3,
         canonical_min_age_days: int = 14,
-    ) -> Sequence[LearningSearchHit]: ...
+        source_session_ids: Sequence[str] | None = None,
+    ) -> Sequence[LearningSearchHit]:
+        """Hybrid search; ``source_session_ids`` (when set) restricts hits.
+
+        Atelier needs to ask "answer this query, but only consider learnings
+        distilled from sessions X, Y, Z". Passing ``None`` (the default)
+        keeps the existing behaviour of searching every active learning.
+        An empty sequence is treated as "no allowed sessions" and returns
+        zero hits — same as a scope filter that matches nothing.
+        """
 
 
 @runtime_checkable

@@ -39,6 +39,7 @@ def _learning(
     bm25_text: str,
     scope: str = "session",
     archived_at: str | None = None,
+    source_session: str | None = None,
 ) -> Learning:
     return Learning(
         learning_id=learning_id,
@@ -47,6 +48,7 @@ def _learning(
         why="because tests",
         bm25_text=bm25_text,
         archived_at=archived_at,
+        source_session=source_session,
         created_at="2026-05-22T00:00:00Z",
         updated_at="2026-05-22T00:00:00Z",
     )
@@ -342,6 +344,71 @@ async def test_search_hybrid_filters_by_scope() -> None:
 
     hits = await store.search_hybrid(query_text="x", query_vector=[1.0], top_k=5, scope="session")
     assert {h.learning.learning_id for h in hits} == {"s"}
+
+
+@pytest.mark.asyncio
+async def test_search_hybrid_filters_by_source_session_ids() -> None:
+    """``source_session_ids`` restricts hits to allowed sessions only."""
+
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("a", rule="x", bm25_text="x", source_session="sess-a"),
+        embedding=[1.0],
+    )
+    await store.insert(
+        _learning("b", rule="x", bm25_text="x", source_session="sess-b"),
+        embedding=[1.0],
+    )
+    await store.insert(
+        _learning("c", rule="x", bm25_text="x", source_session=None),
+        embedding=[1.0],
+    )
+
+    # Single session id keeps only matching rows.
+    hits = await store.search_hybrid(
+        query_text="x",
+        query_vector=[1.0],
+        top_k=5,
+        source_session_ids=["sess-a"],
+    )
+    assert {h.learning.learning_id for h in hits} == {"a"}
+
+    # Multiple ids union the filter.
+    hits = await store.search_hybrid(
+        query_text="x",
+        query_vector=[1.0],
+        top_k=5,
+        source_session_ids=["sess-a", "sess-b"],
+    )
+    assert {h.learning.learning_id for h in hits} == {"a", "b"}
+
+    # ``None`` (the default) keeps every active row, including ones with
+    # ``source_session=None``.
+    hits = await store.search_hybrid(
+        query_text="x",
+        query_vector=[1.0],
+        top_k=5,
+    )
+    assert {h.learning.learning_id for h in hits} == {"a", "b", "c"}
+
+
+@pytest.mark.asyncio
+async def test_search_hybrid_empty_source_session_ids_returns_no_hits() -> None:
+    """An empty allow-list short-circuits to zero hits (no implicit fallback)."""
+
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning("a", rule="x", bm25_text="x", source_session="sess-a"),
+        embedding=[1.0],
+    )
+
+    hits = await store.search_hybrid(
+        query_text="x",
+        query_vector=[1.0],
+        top_k=5,
+        source_session_ids=[],
+    )
+    assert hits == ()
 
 
 @pytest.mark.asyncio
