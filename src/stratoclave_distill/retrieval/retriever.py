@@ -163,6 +163,7 @@ class Retriever:
         *,
         scope: LearningScope | None = None,
         gap_session_id: str | None = None,
+        source_session_ids: Sequence[str] | None = None,
     ) -> RetrievalResult:
         """Embed ``query_text`` and return canonical / emerging hits.
 
@@ -177,6 +178,11 @@ class Retriever:
             Optional session id passed to :meth:`GapStore.list_unresolved`
             so prompts can surface session-local open questions. ``None``
             asks for global unresolved gaps.
+        source_session_ids:
+            Optional restriction: only consider learnings whose
+            ``source_session`` is in this list. Used by atelier's "ask
+            another session" path so retrieval is scoped to the user's
+            picked sessions.
         """
 
         if not query_text:
@@ -195,6 +201,7 @@ class Retriever:
             lane="canonical",
             canonical_min_evidence=self._canonical_min_evidence,
             canonical_min_age_days=self._canonical_min_age_days,
+            source_session_ids=source_session_ids,
         )
         emerging = await self._store.search_hybrid(
             query_text=query_text,
@@ -205,6 +212,7 @@ class Retriever:
             lane="emerging",
             canonical_min_evidence=self._canonical_min_evidence,
             canonical_min_age_days=self._canonical_min_age_days,
+            source_session_ids=source_session_ids,
         )
 
         conflicts: tuple[LearningConflict, ...] = ()

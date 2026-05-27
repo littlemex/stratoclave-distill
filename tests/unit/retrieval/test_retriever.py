@@ -85,6 +85,7 @@ def _learning(
     scope: str = "session",
     evidence_count: int = 1,
     created_offset_days: int = 30,
+    source_session: str | None = None,
 ) -> Learning:
     """Build a Learning with ``created_at`` ``offset`` days in the past."""
 
@@ -96,6 +97,7 @@ def _learning(
         why="because tests",
         bm25_text=bm25_text,
         evidence_count=evidence_count,
+        source_session=source_session,
         created_at=created.strftime("%Y-%m-%dT%H:%M:%SZ"),
         updated_at=created.strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
@@ -290,6 +292,91 @@ async def test_retrieve_honors_per_lane_top_k() -> None:
     result = await retriever.retrieve("rule")
     assert len(result.canonical) == 2
     assert len(result.emerging) == 3
+
+
+# --------------------------------------------------------------------------
+# source_session_ids forwarding
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retrieve_filters_by_source_session_ids() -> None:
+    """End-to-end: ``source_session_ids`` restricts both lanes."""
+
+    store = InMemoryLearningStore()
+    # Canonical-eligible across two sessions.
+    await store.insert(
+        _learning(
+            "can-a",
+            rule="rule",
+            bm25_text="rule",
+            evidence_count=10,
+            created_offset_days=60,
+            source_session="sess-a",
+        ),
+        embedding=[1.0, 0.0],
+    )
+    await store.insert(
+        _learning(
+            "can-b",
+            rule="rule",
+            bm25_text="rule",
+            evidence_count=10,
+            created_offset_days=60,
+            source_session="sess-b",
+        ),
+        embedding=[1.0, 0.0],
+    )
+    # Emerging-eligible across two sessions.
+    await store.insert(
+        _learning(
+            "em-a",
+            rule="rule",
+            bm25_text="rule",
+            evidence_count=1,
+            created_offset_days=60,
+            source_session="sess-a",
+        ),
+        embedding=[1.0, 0.0],
+    )
+    await store.insert(
+        _learning(
+            "em-b",
+            rule="rule",
+            bm25_text="rule",
+            evidence_count=1,
+            created_offset_days=60,
+            source_session="sess-b",
+        ),
+        embedding=[1.0, 0.0],
+    )
+
+    retriever = Retriever(store, _FixedEmbedder([1.0, 0.0]))
+    result = await retriever.retrieve("rule", source_session_ids=["sess-a"])
+    assert {h.learning.learning_id for h in result.canonical} == {"can-a"}
+    assert {h.learning.learning_id for h in result.emerging} == {"em-a"}
+
+
+@pytest.mark.asyncio
+async def test_retrieve_empty_source_session_ids_yields_no_hits() -> None:
+    """Passing an empty allow-list shorts both lanes to zero hits."""
+
+    store = InMemoryLearningStore()
+    await store.insert(
+        _learning(
+            "lid-1",
+            rule="rule",
+            bm25_text="rule",
+            evidence_count=10,
+            source_session="sess-a",
+        ),
+        embedding=[1.0, 0.0],
+    )
+
+    retriever = Retriever(store, _FixedEmbedder([1.0, 0.0]))
+    result = await retriever.retrieve("rule", source_session_ids=[])
+    assert result.canonical == ()
+    assert result.emerging == ()
 
 
 # --------------------------------------------------------------------------
